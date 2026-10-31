@@ -73,6 +73,12 @@ Each is a piece of work of its own, in this order.
 5. **Formatting**: number formats (fixed, percent, currency, dates), bold/italic, alignment, fill
    colour — kept in the model and in `.xlsx`.
 6. **Several sheets**: tabs, cross-sheet references, rename, insert, delete.
-7. **More functions**: dates and times, `SUMIF`/`COUNTIF`/`AVERAGEIF` and their `S` forms, text
+7. **Scripting in slate**: functions a cell can call (`=TAX(B2)`), macros on the menu that read and
+   change the workbook, and `abax-cli run <script>` for batch work. slate is taken **as a sysl
+   library**, not through its C API — slate is enhanced with a sysl embedding surface (load a script,
+   call by name, values across the boundary without a C hop, host functions, a step budget,
+   cancellation, and a sandbox with no file or network access, since a script arrives inside a file
+   someone else sent). Measured: the cost of a user function called across a hundred thousand cells.
+8. **More functions**: dates and times, `SUMIF`/`COUNTIF`/`AVERAGEIF` and their `S` forms, text
    functions, `XLOOKUP`, financial basics.
-8. **Large sheets**: a million rows loaded and scrolled at frame rate; recalculation measured.
+9. **Large sheets**: a million rows loaded and scrolled at frame rate; recalculation measured.
