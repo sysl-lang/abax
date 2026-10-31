@@ -106,7 +106,7 @@ sheet_references()
 calls()
     assert_eq(round_trip("log10(100)"), "LOG10(100)")
     assert_eq(round_trip("true()"), "TRUE()")
-    assert_eq(round_trip("sum()"), "SUM()")
+    assert_eq(round_trip("unknown()"), "UNKNOWN()")
     assert_eq(round_trip("if(a1,,)"), "IF(A1,,)")
     assert_eq(round_trip("f(g(h(1)))"), "F(G(H(1)))")
 

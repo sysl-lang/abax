@@ -455,11 +455,35 @@ private nud_at(t: Spanned[Tok], p: *Parser) -> &Expr
 
             Group(inner)
         TName(n) ->
-            if p.toks.accept_if(is_open).is_some() then Call(to_upper(n), arguments(p, t)) else Name(n)
+            if p.toks.accept_if(is_open).is_none() then return Name(n)
+
+            val name = to_upper(n)
+            val args = arguments(p, t)
+
+            arity_of(name) match
+                Some((lo, hi)) -> if args.len() < lo || args.len() > hi then p.fail(arity_problem(name, lo, hi, args.len()))
+                None -> ()
+
+            Call(name, args)
         _ ->
             p.fail(s"${describe(t.value)} was not expected, at ${t.span.start + 1}")
             Missing
 end nud_at
+
+// What is wrong with a call given `n` arguments: `ROUND takes 2 arguments, not 1`.
+private arity_problem(name: string, lo: usize, hi: usize, n: usize) -> string
+    val plural = if lo == 1 then "" else "s"
+    var wanted = s"${lo} to ${hi} arguments"
+
+    if hi == 0
+        wanted = "no arguments"
+    elif lo == hi
+        wanted = s"${lo} argument${plural}"
+    elif hi == 255
+        wanted = s"at least ${lo} argument${plural}"
+
+    s"${name} takes ${wanted}, not ${n}"
+end arity_problem
 
 // A call's arguments, after its `(`; an empty one is `Missing`.
 private arguments(p: *Parser, name: Spanned[Tok]) -> Buf[&Expr]
