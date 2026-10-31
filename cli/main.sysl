@@ -1,0 +1,132 @@
+// abax on the command line.
+//
+//     abax-cli <file> [--cell A1 ...]          what cells show, each stored one or those named
+//     abax-cli convert [--formulas] <in> <out>  a file in another format, by extension
+//     abax-cli dump [--formulas] <file>         every stored cell: address, input, value
+//
+// The formats are `.csv`, `.tsv` and `.xlsx`. `--formulas` reads a CSV or TSV field starting with `=`
+// as a formula rather than as text. What the reader could not keep is said on stderr, as `note:` lines.
+
+import sh.sysl.abax.{Sheet, column_name, col_of, row_of, input_of, open_bytes, save_bytes}
+import sysl.buf.{Buf, buf}
+import sysl.eprints
+import sysl.fs.{read_bytes, write_bytes}
+import sysl.slices.sort
+import sysl.text.str_builder
+
+val USAGE = "usage: abax-cli <file> [--cell A1 ...] | abax-cli convert [--formulas] <in> <out> | abax-cli dump [--formulas] <file>"
+
+main(args: []string) -> Result[unit, string]
+    if args.len < 2 then return Err(USAGE)
+
+    var words: Buf[string] = buf()
+    var formulas = false
+
+    for i in 1..<args.len
+        if args[i] == "--formulas" then formulas = true else words.push(args[i])
+
+    if words.len() == 0 then return Err(USAGE)
+
+    if words[0] == "convert"
+        if words.len() != 3 then return Err(USAGE)
+
+        val s = open(words[1], formulas)?
+        val out = save_bytes(s, words[2]).map_err(e -> s"${words[2]}: ${e}")?
+
+        write_bytes(words[2], out.view()).map_err(e -> s"${words[2]}: ${e}")?
+        return Ok(())
+
+    if words[0] == "dump"
+        if words.len() != 2 then return Err(USAGE)
+
+        for line in dump(open(words[1], formulas)?)
+            print(line)
+
+        return Ok(())
+
+    val s = open(words[0], formulas)?
+    var cells: Buf[string] = buf()
+    var i: usize = 1
+
+    while i < words.len()
+        if words[i] != "--cell" || i + 1 >= words.len() then return Err(USAGE)
+
+        cells.push(words[i + 1])
+        i += 2
+
+    for line in show(s, cells)
+        print(line)
+
+    Ok(())
+end main
+
+// A file read into a sheet, its notes said on stderr.
+open(file: string, formulas: bool) -> Result[Sheet, string]
+    val bytes = read_bytes(file).map_err(e -> s"${file}: ${e}")?
+    val got = open_bytes(file, bytes, formulas).map_err(e -> s"${file}: ${e}")?
+
+    for n in got.notes
+        eprints(s"note: ${file}: ${n}\n")
+
+    Ok(got.sheet)
+end open
+
+// The stored cells' keys, in row order.
+private stored(s: Sheet) -> Buf[long]
+    var keys: Buf[long] = buf()
+
+    for (k, _) in s.cells
+        keys.push(k)
+
+    sort(keys.view())
+    keys
+end stored
+
+private address(k: long) -> string = column_name(col_of(k)) + (row_of(k) + 1).to_string()
+
+// What the named cells show, one to a line; with none named, every stored cell as `A1<TAB>shows`.
+show(s: Sheet, cells: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    if cells.len() > 0
+        for c in cells
+            out.push(s.display(c))
+
+        return out
+
+    for k in stored(s)
+        val a = address(k)
+
+        out.push(a + "\t" + s.display(a))
+
+    out
+end show
+
+// Every stored cell as `A1<TAB>input<TAB>value`, the value written exactly and as it would be typed:
+// a number as the shortest text that reads back the same, text with a `'` in front where it would
+// otherwise read as something else (`'12`), so the kinds cannot be confused. A tab, line break or
+// backslash in either is written `\t`, `\n`, `\r`, `\\`.
+dump(s: Sheet) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for k in stored(s)
+        val a = address(k)
+
+        out.push(a + "\t" + plain(s.input(a)) + "\t" + plain(input_of(s.value(a))))
+
+    out
+end dump
+
+private plain(t: string) -> string
+    var sb = str_builder()
+
+    for ch in t.chars
+        ch match
+            '\t' -> sb.push("\\t")
+            '\n' -> sb.push("\\n")
+            '\r' -> sb.push("\\r")
+            '\\' -> sb.push("\\\\")
+            _ -> sb.push_char(ch)
+
+    sb.finish()
+end plain

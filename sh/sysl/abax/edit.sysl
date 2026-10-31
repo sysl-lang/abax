@@ -413,10 +413,13 @@ private quoted(s: string) -> string
     sb.finish()
 end quoted
 
-// Tab-separated text read into lines of fields. A line ends at `\n`, `\r\n` or `\r`; a field that
-// starts with `"` runs to the matching quote, tabs and line breaks included, with `""` for a quote. A
-// last line left empty by a final line break is no line.
-read_tsv(text: string) -> Buf[Buf[string]]
+// Tab-separated text read into lines of fields.
+read_tsv(text: string) -> Buf[Buf[string]] = read_fields(text, u8('\t'))
+
+// Text read into lines of fields split at `sep`, as RFC 4180 reads CSV. A line ends at `\n`, `\r\n` or
+// `\r`; a field that starts with `"` runs to the matching quote, separators and line breaks included,
+// with `""` for a quote. A last line left empty by a final line break is no line.
+read_fields(text: string, sep: u8) -> Buf[Buf[string]]
     var lines: Buf[Buf[string]] = buf()
     var fields: Buf[string] = buf()
     var sb = str_builder()
@@ -440,7 +443,7 @@ read_tsv(text: string) -> Buf[Buf[string]]
         elif c == u8('"') && !started
             quoting = true
             started = true
-        elif c == u8('\t')
+        elif c == sep
             fields.push(sb.finish())
             sb = str_builder()
             started = false
@@ -465,4 +468,4 @@ read_tsv(text: string) -> Buf[Buf[string]]
         lines.push(fields)
 
     lines
-end read_tsv
+end read_fields

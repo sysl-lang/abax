@@ -1,0 +1,18 @@
+// abax on the command line: open a CSV or `.xlsx` file, print its cells, or convert it.
+//
+//     sysl run cli -- budget.xlsx --cell B4
+//     sysl run cli -- convert budget.xlsx budget.csv
+//     sysl run cli -- dump budget.xlsx
+package { name = "abax-cli", version = "0.1.0", sysl = "0.8.10" }
+
+optimization = "2"
+
+// `os` to read and write the files.
+requires {
+  os   = true
+  heap = true
+}
+
+dependencies {
+  abax { workspace = true }
+}

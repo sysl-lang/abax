@@ -114,7 +114,9 @@ private arithmetic(op: BinOp, x: real, y: real) -> Value
 end arithmetic
 
 // How two values order, as a comparison operator sees them: numbers before text before logicals, text
-// without regard to case, and an empty cell as the other side's kind of nothing.
+// without regard to case, and an empty cell as the other side's kind of nothing. **Two numbers within
+// one part in 2^48 of each other are equal**, as Excel and LibreOffice both take them, so
+// `0.1+0.2=0.3` is TRUE although the sum is not exactly the `real` nearest 0.3.
 compare(a: Value, b: Value) -> int
     val l = blank_as(a, b)
     val r = blank_as(b, a)
@@ -127,7 +129,7 @@ compare(a: Value, b: Value) -> int
         Number(x) ->
             val y = to_number(r).unwrap()
 
-            if x < y then -1 elif x > y then 1 else 0
+            if x == y || (x - y).abs() < x.abs().max(y.abs()) * 3.552713678800501e-15 then 0 elif x < y then -1 else 1
         Text(t) ->
             val u = to_upper(t)
             val v = to_upper(to_text(r).unwrap())
@@ -159,16 +161,16 @@ private kind_rank(v: Value) -> int = v match
 // --- Functions --------------------------------------------------------------------------------------
 
 // Every function this engine knows, for a name box or an autocompleter.
-val FUNCTIONS = ["ABS", "AND", "AVERAGE", "CONCAT", "CONCATENATE", "COUNT", "COUNTA", "COUNTBLANK", "HLOOKUP",
-    "IF", "IFERROR", "INDEX", "INT", "ISBLANK", "ISERROR", "ISNUMBER", "ISTEXT", "LEFT", "LEN", "LOWER", "MATCH",
+val FUNCTIONS = ["ABS", "AND", "AVERAGE", "CONCAT", "CONCATENATE", "COUNT", "COUNTA", "COUNTBLANK", "FALSE",
+    "HLOOKUP", "IF", "IFERROR", "INDEX", "INT", "ISBLANK", "ISERROR", "ISNUMBER", "ISTEXT", "LEFT", "LEN", "LOWER", "MATCH",
     "MAX", "MID", "MIN", "MOD", "NOT", "OR", "PI", "POWER", "PRODUCT", "RIGHT", "ROUND", "ROUNDDOWN", "ROUNDUP",
-    "SQRT", "SUM", "TRIM", "UPPER", "VLOOKUP"]
+    "SQRT", "SUM", "TRIM", "TRUE", "UPPER", "VLOOKUP"]
 
 // How many arguments a function takes, fewest and most, if it is one this engine knows. The parser
 // refuses a call outside these, as Excel refuses it at entry; an unknown name is left to evaluate to
 // `#NAME?`.
 arity_of(name: string) -> Option[(usize, usize)]
-    if name == "PI" then return Some((0, 0))
+    if name == "PI" || name == "TRUE" || name == "FALSE" then return Some((0, 0))
     if name == "IF" then return Some((1, 3))
     if name == "MID" then return Some((3, 3))
     if one_of(name, ["VLOOKUP", "HLOOKUP"]) then return Some((3, 4))
@@ -283,6 +285,12 @@ private call(s: Sheet, name: string, args: Buf[&Expr]) -> Result[Value, Fault]
         arity(n, 0, 0)?
 
         return Ok(Number(3.141592653589793))
+
+    // The logicals as functions, which is how LibreOffice writes a logical into an .xlsx.
+    if name == "TRUE" || name == "FALSE"
+        arity(n, 0, 0)?
+
+        return Ok(Bool(name == "TRUE"))
 
     if name == "LEFT" || name == "RIGHT" || name == "MID" || name == "LEN" || name == "UPPER" || name == "LOWER" || name == "TRIM"
         return Ok(text_function(s, name, args)?)

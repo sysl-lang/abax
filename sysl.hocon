@@ -4,21 +4,24 @@
 //       abax { git = "github.com/sysl-lang/abax", version = "0.1.0" }
 //     }
 //
-// The library is `sh.sysl.abax` and needs nothing but an allocator. The application, a window with a
-// menu, a formula bar and the grid, is the workspace member in `app/`, so a program taking the library
-// does not take SDL with it.
+// The library is `sh.sysl.abax` and needs nothing but an allocator: it reads and writes CSV and `.xlsx`
+// as bytes. The application, a window with a menu, a formula bar and the grid, is the workspace member
+// in `app/`, so a program taking the library does not take SDL with it; `cli/` is `abax-cli`, which
+// prints and converts files.
 package { name = "abax", version = "0.1.0", sysl = "0.8.10" }
 
 optimization = "2"
 
-workspace = ["app"]
+workspace = ["app", "cli"]
 
 // `heap` for the cells, the formula trees and the dependency graph.
 requires {
   heap = true
 }
 
-// The formula parser runs on the Pratt loop and the token cursor.
+// The formula parser runs on the Pratt loop and the token cursor; an `.xlsx` is a zip of XML parts.
 dependencies {
   parsing { git = "github.com/sysl-lang/parsing", version = "0.13.3" }
+  zip     { git = "github.com/sysl-lang/zip", version = "0.1.0" }
+  xml     { git = "github.com/sysl-lang/xml", version = "0.1.0" }
 }

@@ -1,0 +1,49 @@
+module sh.sysl.abax
+
+import sysl.buf.{Buf, buf}
+import sysl.text.to_lower
+
+// The file formats by name: what a program with a file name in hand calls, so that it need not know
+// which reader goes with which extension. The bytes are the caller's to read and write.
+
+// The format a file name's extension says, if it is one abax reads and writes.
+enum Format
+    Csv
+    Tsv
+    Xlsx
+
+format_of(file: string) -> Option[Format]
+    val f = to_lower(file)
+
+    if f.ends_with(".csv") then return Some(Csv)
+    if f.ends_with(".tsv") || f.ends_with(".tab") then return Some(Tsv)
+    if f.ends_with(".xlsx") then return Some(Xlsx)
+
+    None
+end format_of
+
+// A sheet from the bytes of the file called `file`. `formulas` is for CSV and TSV, where a field
+// starting with `=` is text unless it is asked for.
+open_bytes(file: string, bytes: []const u8, formulas: bool = false) -> Result[Loaded, string]
+    format_of(file) match
+        Some(Csv) -> Ok(Loaded(read_csv(bytes, u8(','), formulas)?, buf()))
+        Some(Tsv) -> Ok(Loaded(read_csv(bytes, u8('\t'), formulas)?, buf()))
+        Some(Xlsx) -> read_xlsx(bytes)
+        None -> Err(s"'${file}' is not a .csv, .tsv or .xlsx file")
+end open_bytes
+
+// A sheet as the bytes of the file called `file`.
+save_bytes(s: Sheet, file: string) -> Result[Buf[u8], string]
+    format_of(file) match
+        Some(Csv) -> Ok(bytes_of(write_csv(s)))
+        Some(Tsv) -> Ok(bytes_of(write_csv(s, u8('\t'))))
+        Some(Xlsx) -> write_xlsx(s)
+        None -> Err(s"'${file}' is not a .csv, .tsv or .xlsx file")
+end save_bytes
+
+private bytes_of(t: string) -> Buf[u8]
+    var out: Buf[u8] = buf()
+
+    out.extend(t.bytes)
+    out
+end bytes_of

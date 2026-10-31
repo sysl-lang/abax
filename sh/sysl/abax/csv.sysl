@@ -1,0 +1,117 @@
+module sh.sysl.abax
+
+import sysl.text.{from_utf8, str_builder}
+
+// CSV, as RFC 4180 describes it and as every spreadsheet reads it: a line to a row, fields split at a
+// separator, a field quoted when it holds the separator, a quote or a line break, with `""` for a
+// quote inside one.
+//
+// **What is read**: each field is taken as if it had been typed, so `12` is a number, `TRUE` a logical
+// and `#N/A` an error -- but **a field starting with `=` is text unless the caller asks for formulas**.
+// A CSV is data handed over by another program, and a formula inside one is a way to make a sheet do
+// something its reader did not ask for ("CSV injection"); what abax writes holds values, never
+// formulas, so nothing abax wrote is lost by the default. A field starting with `'` is kept with its
+// `'`, since that is what the file says. Line ends may be `\r\n`, `\n` or `\r`, and a UTF-8 byte-order
+// mark in front is dropped.
+//
+// **What is written**: the values, never the formulas, from A1 to the last row and column that hold
+// anything, every line ended by `\r\n`. A number is written as the shortest text that reads back to
+// the same number -- not as General format shows it -- so a CSV round trip keeps every digit. Text
+// that would read back as something else (`007`, `TRUE`) comes back as that something else: a CSV has
+// no way to say a field is text.
+
+// A sheet called `name` read from CSV bytes split at `sep`. With `formulas`, a field starting with `=`
+// is a formula, and one that does not parse is kept as text. Bytes that are not UTF-8, or more rows or
+// columns than a sheet has, are refused.
+read_csv(bytes: []const u8, sep: u8 = u8(','), formulas: bool = false, name: string = "Sheet1") -> Result[Sheet, string]
+    val b = if bytes.len >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF then bytes[3..] else bytes
+    val text = from_utf8(b) match
+        Ok(t) -> t
+        Err(e) -> return Err(s"the file is not UTF-8 text: byte ${e.offset} is not part of a character")
+
+    val lines = read_fields(text, sep)
+
+    if lines.len() > usize(MAX_ROWS) then return Err(s"the file has ${lines.len()} lines, more than a sheet's ${MAX_ROWS} rows")
+
+    var s = sheet(name)
+
+    for r in 0..<lines.len()
+        val fields = lines[r]
+
+        if fields.len() > usize(MAX_COLS)
+            return Err(s"line ${r + 1} has ${fields.len()} fields, more than a sheet's ${MAX_COLS} columns")
+
+        for c in 0..<fields.len()
+            val f = fields[c]
+
+            if f.len == 0 then continue
+
+            val k = key(int(c), int(r))
+            val input = if f.starts_with("'") || (!formulas && f.starts_with("=")) then "'" + f else f
+
+            s.put(k, input) match
+                Ok(_) -> ()
+                Err(_) -> val _ = s.put(k, "'" + f)
+
+    s.loaded()
+    Ok(s)
+end read_csv
+
+// A sheet's values as CSV with `sep` between fields.
+write_csv(s: Sheet, sep: u8 = u8(',')) -> string
+    var cols = -1
+    var rows = -1
+
+    for (k, _) in s.cells
+        cols = cols.max(col_of(k))
+        rows = rows.max(row_of(k))
+
+    var sb = str_builder()
+
+    for r in 0..<rows + 1
+        for c in 0..<cols + 1
+            if c > 0 then sb.bytes.push(sep)
+
+            sb.push(csv_field(s.value_at(c, r), sep))
+
+        sb.push("\r\n")
+
+    sb.finish()
+end write_csv
+
+// One value as a CSV field.
+private csv_field(v: Value, sep: u8) -> string
+    v match
+        Number(x) -> shortest_text(x)
+        Text(t) -> csv_quoted(t, sep)
+        _ -> v.display()
+
+// Text as a CSV field: quoted, with its quotes doubled, when it holds the separator, a quote or a line
+// break.
+private csv_quoted(t: string, sep: u8) -> string
+    var plain = true
+
+    for c in t.bytes
+        if c == sep || c == u8('"') || c == u8('\n') || c == u8('\r') then plain = false
+
+    if plain then return t
+
+    var sb = str_builder()
+
+    sb.push("\"")
+
+    for ch in t.chars
+        if ch == '"' then sb.push("\"\"") else sb.push_char(ch)
+
+    sb.push("\"")
+    sb.finish()
+end csv_quoted
+
+// The input that puts `text` into a cell as text, whatever it looks like: `'` in front of anything that
+// would otherwise read as a number, a logical, an error code or a formula, or that starts with `'`.
+text_input(text: string) -> string
+    if text.len == 0 then return "'"
+
+    read_input(text) match
+        Ok(Constant(Text(t))) -> if t == text then text else "'" + text
+        _ -> "'" + text

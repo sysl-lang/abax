@@ -190,6 +190,33 @@ struct Sheet
             self.journal.redo.clear()
     end settle
 
+    // A cell read from a file: put as typed, but a formula keeps the value the file cached for it
+    // rather than being worked out, as Excel and LibreOffice keep it until something recalculates.
+    // A formula with nothing cached is left to `loaded` to work out.
+    private[abax] load(*self, k: long, input: string, cached: Option[Value]) -> Result[unit, string]
+        self.put(k, input)?
+
+        val _ = self.dirty.pop()
+
+        self.cells.get(k) match
+            Some(slot) ->
+                slot.content match
+                    Formula(_) ->
+                        cached match
+                            Some(v) -> self.cells.put(k, Slot(slot.input, slot.content, v, slot.reads))
+                            None -> self.dirty.push(k)
+                    Constant(_) -> ()
+            None -> ()
+
+        Ok(())
+    end load
+
+    // The end of reading a file: whatever is waiting worked out, and none of it kept as a step to
+    // undo, since a file opened is where its history starts.
+    private[abax] loaded(*self)
+        self.settle()
+        self.journal = journal()
+
     // Every formula on the sheet worked out again, in dependency order.
     recalculate(*self)
         var all: Buf[long] = buf()

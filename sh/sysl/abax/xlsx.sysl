@@ -1,0 +1,747 @@
+module sh.sysl.abax
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.slices.sort
+import sysl.text.{parse_int, parse_long_base, str_builder, to_upper}
+import sh.sysl.zip.{Archive, open as zip_open, writer as zip_writer}
+import sh.sysl.xml.{Attr, Element, Event, XmlWriter, parse_bytes, reader, text_of, writer as xml_writer}
+
+// `.xlsx`, Office Open XML's spreadsheet package: a zip of XML parts, read and written as bytes.
+//
+// **Reading** follows the package's own pointers rather than assuming part names: `_rels/.rels` names
+// the workbook, the workbook's relationships name its sheets and its shared strings. **The first sheet
+// is read**, since a sheet is what abax holds; the others are named in the notes. A cell becomes what
+// typing it would give -- a number, text (with a `'` where it would read as something else), a
+// logical, an error, or a formula -- and **a formula keeps the value the file cached for it** until
+// something recalculates. A shared formula is expanded into each of its cells by copying the first
+// cell's formula there, which moves its relative references as a paste does. Excel's `_xlfn.` prefix
+// on functions newer than 2007 is dropped. A formula abax cannot read keeps its cached value as a
+// constant, and the notes say so. The sheet XML is read as a stream of events, so a big sheet is
+// never a tree.
+//
+// **Writing** gives the smallest package Excel and LibreOffice both open without a repair: content
+// types, relationships, a workbook of one sheet, the sheet, the shared strings and a style sheet with
+// the one default style. A formula is written without its `=` and with the value abax worked out for
+// it, typed; strings are shared; numbers are the shortest text that reads back the same. The same
+// sheet gives the same bytes.
+//
+// **Column widths** are converted with Excel's own rule for its default font, Calibri 11, whose widest
+// digit is 7 pixels: a width `w` in the file is `floor((256 w + 18) / 256 * 7)` pixels, and a width of
+// `p` pixels is written as `floor(p / 7 * 256) / 256`. abax keeps widths in those pixels, so Excel's
+// standard 8.43 characters (64 pixels) reads as 64.
+
+private val MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+private val RELS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+private val PACKAGE_RELS = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+// Functions Excel added after 2007, which it writes with `_xlfn.` in front so that an older Excel
+// shows `#NAME?` rather than misreading them.
+private val NEWER_FUNCTIONS = ["CONCAT"]
+
+// A sheet read from a file, and what the reader could not keep as it was.
+struct Loaded
+    sheet: Sheet
+    notes: Buf[string]
+
+// --- Reading -------------------------------------------------------------------------------------------
+
+// The first sheet of an `.xlsx` package.
+read_xlsx(bytes: []const u8) -> Result[Loaded, string]
+    val zip = zip_open(bytes).map_err(e -> s"not an .xlsx file: ${e}")?
+
+    if zip.find("[Content_Types].xml").is_none() then return Err("not an .xlsx file: it has no [Content_Types].xml")
+
+    var book_part = "xl/workbook.xml"
+
+    if zip.find("_rels/.rels").is_some()
+        val top = relations(zip, "")?
+
+        for (_, rel) in top
+            if rel.0.ends_with("/officeDocument") then book_part = rel.1
+
+    val book = part_tree(zip, book_part)?
+    val rels = relations(zip, book_part)?
+    val sheets = book.child("sheets") match
+        Some(e) -> e.elements_named("sheet")
+        None -> buf()
+
+    if sheets.len() == 0 then return Err(s"${book_part} names no sheet")
+
+    val first = sheets.at(0)
+    val name = first.attr("name").unwrap_or("Sheet1")
+    val id = relation_id(first) match
+        Some(got) -> got
+        None -> return Err(s"${book_part}: the sheet '${name}' has no relationship id")
+    val sheet_part = rels.get(id) match
+        Some(rel) -> rel.1
+        None -> return Err(s"${book_part}: the sheet '${name}' names relationship '${id}', which is not there")
+
+    var notes: Buf[string] = buf()
+
+    if sheets.len() > 1
+        var others = ""
+
+        for i in 1..<sheets.len()
+            others = others + (if i > 1 then ", " else "") + "'" + sheets.at(i).attr("name").unwrap_or("?") + "'"
+
+        notes.push(s"only the first sheet, '${name}', was read, since abax has one sheet; left out: ${others}")
+
+    var strings: Buf[string] = buf()
+
+    for (_, rel) in rels
+        if rel.0.ends_with("/sharedStrings") then strings = shared_strings(zip, rel.1)?
+
+    var s = sheet(name)
+
+    read_cells(zip, sheet_part, strings, &s, &notes)?
+    s.loaded()
+    Ok(Loaded(s, notes))
+end read_xlsx
+
+// A part's bytes; a part the package names but does not hold is an error.
+private part_bytes(zip: Archive, part: string) -> Result[Buf[u8], string]
+    val e = zip.find(part) match
+        Some(got) -> got
+        None -> return Err(s"the package has no part '${part}'")
+
+    zip.read(e).map_err(err -> s"${part}: ${err}")
+end part_bytes
+
+private part_tree(zip: Archive, part: string) -> Result[&Element, string]
+    val bytes = part_bytes(zip, part)?
+    val doc = parse_bytes(bytes.view()).map_err(e -> s"${part}: ${e}")?
+
+    Ok(doc.root)
+end part_tree
+
+// A part's relationships, by id: each one's type and the part it points at, as a name inside the
+// package. `part` "" is the package's own, in `_rels/.rels`.
+private relations(zip: Archive, part: string) -> Result[Map[string, (string, string)], string]
+    val dir = folder_of(part)
+    val rels_part = dir + "_rels/" + part[dir.len..] + ".rels"
+    var out: Map[string, (string, string)] = map()
+
+    if zip.find(rels_part).is_none() then return Ok(out)
+
+    val root = part_tree(zip, rels_part)?
+
+    for r in root.elements_named("Relationship")
+        if r.attr("TargetMode").unwrap_or("") == "External" then continue
+
+        val id = r.attr("Id").unwrap_or("")
+        val target = r.attr("Target").unwrap_or("")
+
+        out.put(id, (r.attr("Type").unwrap_or(""), resolve(dir, target)))
+
+    Ok(out)
+end relations
+
+// The folder a part is in, with its `/`: "xl/" for "xl/workbook.xml", "" for a part at the top.
+private folder_of(part: string) -> string
+    var i = part.len
+
+    while i > 0 && part.bytes[i - 1] != u8('/')
+        i -= 1
+
+    part[0..<i]
+end folder_of
+
+// A relationship's target as a part name: from the top when it starts with `/`, else from `dir`, with
+// `..` stepping out of a folder.
+private resolve(dir: string, target: string) -> string
+    val full = if target.starts_with("/") then target[1..] else dir + target
+    var parts: Buf[string] = buf()
+    var start: usize = 0
+
+    for i in 0..full.len
+        if i == full.len || full.bytes[i] == u8('/')
+            val piece = full[start..<i]
+
+            if piece == ".."
+                val _ = parts.pop()
+            elif piece.len > 0 && piece != "."
+                parts.push(piece)
+
+            start = i + 1
+
+    var sb = str_builder()
+
+    for i in 0..<parts.len()
+        if i > 0 then sb.push("/")
+
+        sb.push(parts[i])
+
+    sb.finish()
+end resolve
+
+// A `<sheet>`'s `r:id`, whatever the prefix and whichever namespace (transitional or strict) it is in.
+private relation_id(e: &Element) -> Option[string]
+    for a in e.attrs
+        if a.name.local == "id" && a.name.ns.len > 0 then return Some(a.value)
+
+    None
+end relation_id
+
+// The shared-string table: each `<si>`'s text, plain or the runs of rich text run together, without
+// the phonetic guides some East Asian text carries.
+private shared_strings(zip: Archive, part: string) -> Result[Buf[string], string]
+    val root = part_tree(zip, part)?
+    var out: Buf[string] = buf()
+
+    for si in root.elements_named("si")
+        si.child("t") match
+            Some(t) -> out.push(unescaped(t.text()))
+            None ->
+                var sb = str_builder()
+
+                for run in si.elements_named("r")
+                    run.child("t") match
+                        Some(t) -> sb.push(t.text())
+                        None -> ()
+
+                out.push(unescaped(sb.finish()))
+
+    Ok(out)
+end shared_strings
+
+private attr_of(attrs: Buf[Attr], local: string) -> Option[string]
+    for a in attrs
+        if a.name.local == local && a.name.ns.len == 0 then return Some(a.value)
+
+    None
+end attr_of
+
+// Where a cell's text is going while its XML is read.
+private enum Field
+    NoField
+    InValue
+    InFormula
+    InInline
+
+// The first cell of a shared formula, which the others are copies of.
+private struct Master
+    col: int
+    row: int
+    e: &Expr
+
+// What one `<c>` said, gathered as its XML goes by.
+private struct CellXml
+    col: int
+    row: int
+    kind: string
+    value: string
+    has_value: bool
+    formula: string
+    has_formula: bool
+    formula_kind: string
+    shared: string
+
+// The cells and column widths of a worksheet part, read as a stream.
+private read_cells(zip: Archive, part: string, strings: Buf[string], s: *Sheet, notes: *Buf[string]) -> Result[unit, string]
+    val bytes = part_bytes(zip, part)?
+    val text = text_of(bytes.view()).map_err(e -> s"${part}: ${e}")?
+    var r = reader(text)
+    var masters: Map[string, Master] = map()
+    var row = -1
+    var col = -1
+    var field = NoField
+    var in_inline = false
+    var in_phonetic = false
+    var sb = str_builder()
+    var cell = CellXml(0, 0, "", "", false, "", false, "", "")
+    var arrays = false
+
+    loop
+        val ev = r.next().map_err(e -> s"${part}: ${e}")?
+
+        ev match
+            Event.Start(name, attrs, _) ->
+                name.local match
+                    "row" ->
+                        row = attr_of(attrs, "r") match
+                            Some(t) -> number_in(t, part, "row number")? - 1
+                            None -> row + 1
+                        col = -1
+
+                        if row < 0 || row >= MAX_ROWS then return Err(s"${part}: row ${row + 1} is outside the sheet")
+                    "c" ->
+                        attr_of(attrs, "r") match
+                            Some(t) ->
+                                val got = parse_ref(t) match
+                                    Some(at) -> at
+                                    None -> return Err(s"${part}: '${t}' is not a cell on the sheet")
+                                col = got.col
+                                row = got.row
+                            None ->
+                                col += 1
+                                row = row.max(0)
+
+                        if col >= MAX_COLS then return Err(s"${part}: a cell of row ${row + 1} is past column XFD")
+
+                        cell = CellXml(col, row, attr_of(attrs, "t").unwrap_or("n"), "", false, "", false, "", "")
+                    "v" ->
+                        field = InValue
+                        sb = str_builder()
+                    "f" ->
+                        field = InFormula
+                        sb = str_builder()
+                        cell.has_formula = true
+                        cell.formula_kind = attr_of(attrs, "t").unwrap_or("normal")
+                        cell.shared = attr_of(attrs, "si").unwrap_or("")
+                    "is" ->
+                        in_inline = true
+                        sb = str_builder()
+                    "rPh" -> in_phonetic = true
+                    "t" -> if in_inline && !in_phonetic then field = InInline
+                    "col" -> column_width(attrs, part, s)?
+                    _ -> ()
+            Event.Text(t) -> if field != NoField then sb.push(t)
+            Event.CData(t) -> if field != NoField then sb.push(t)
+            Event.End(name) ->
+                name.local match
+                    "v" ->
+                        cell.value = sb.finish()
+                        cell.has_value = true
+                        field = NoField
+                    "f" ->
+                        cell.formula = sb.finish()
+                        field = NoField
+                    "t" -> if field == InInline then field = NoField
+                    "rPh" -> in_phonetic = false
+                    "is" ->
+                        in_inline = false
+                        cell.value = unescaped(sb.finish())
+                        cell.has_value = true
+                    "c" ->
+                        if cell.has_formula && cell.formula_kind == "array" then arrays = true
+
+                        put_cell(cell, strings, &masters, part, s, notes)?
+                    _ -> ()
+            Event.Eof -> break
+            _ -> ()
+
+    if arrays then notes.push("array formulas were read as ordinary formulas in their first cell; the cells they spill into keep their values")
+
+    Ok(())
+end read_cells
+
+// A whole number in an attribute, or an error naming what it was meant to be.
+private number_in(t: string, part: string, what: string) -> Result[int, string]
+    parse_int(t).map_err(_ -> s"${part}: '${t}' is not a ${what}")
+
+// A `<col>`'s width given to every column it covers, where the file says the width was set.
+private column_width(attrs: Buf[Attr], part: string, s: *Sheet) -> Result[unit, string]
+    val custom = attr_of(attrs, "customWidth").unwrap_or("0")
+
+    if custom != "1" && custom != "true" then return Ok(())
+
+    val w = attr_of(attrs, "width") match
+        Some(t) ->
+            number_of(t) match
+                Some(x) -> x
+                None -> return Err(s"${part}: '${t}' is not a column width")
+        None -> return Ok(())
+
+    val lo = number_in(attr_of(attrs, "min").unwrap_or("1"), part, "column number")?.max(1)
+    val hi = number_in(attr_of(attrs, "max").unwrap_or("1"), part, "column number")?.min(MAX_COLS)
+    val px = width_from_excel(w)
+
+    if px <= 0 then return Ok(())
+
+    for c in lo..hi
+        s.widths.put(c - 1, px)
+
+    Ok(())
+end column_width
+
+// Excel's column width, in characters of its default font, as pixels.
+width_from_excel(w: real) -> int = int(((256.0 * w + 18.0) / 256.0 * 7.0).floor())
+
+// Pixels as Excel's column width.
+width_to_excel(px: int) -> real = (real(px) / 7.0 * 256.0).floor() / 256.0
+
+// One cell, as its XML said, put on the sheet.
+private put_cell(c: CellXml, strings: Buf[string], masters: *Map[string, Master], part: string, s: *Sheet, notes: *Buf[string]) -> Result[unit, string]
+    val addr = column_name(c.col) + (c.row + 1).to_string()
+    val k = key(c.col, c.row)
+    val cached = cached_value(c, strings, addr, part)?
+    var formula: Option[&Expr] = None
+
+    if c.has_formula && c.formula_kind != "dataTable"
+        if c.formula_kind == "shared" && c.formula.len == 0
+            masters.get(c.shared) match
+                Some(m) -> formula = Some(adjust(m.e, s.name, Copied(c.col - m.col, c.row - m.row)))
+                None -> notes.push(s"${addr}: its shared formula ${c.shared} has no first cell; its value was kept")
+        elif c.formula.len > 0
+            parse_formula(c.formula) match
+                Ok(e) ->
+                    val tree = without_prefixes(e)
+
+                    formula = Some(tree)
+
+                    if c.formula_kind == "shared" then masters.put(c.shared, Master(c.col, c.row, tree))
+                Err(m) -> notes.push(s"${addr}: abax cannot read the formula =${c.formula} (${m}); its value was kept")
+
+    formula match
+        Some(e) -> s.load(k, "=" + formula_text(e), cached).map_err(m -> s"${part}: ${addr}: ${m}")?
+        None ->
+            cached match
+                Some(v) -> s.load(k, input_of(v), None).map_err(m -> s"${part}: ${addr}: ${m}")?
+                None -> ()
+
+    Ok(())
+end put_cell
+
+// What a cell's `<v>` (or inline string) holds, by its type; nothing when it holds nothing.
+private cached_value(c: CellXml, strings: Buf[string], addr: string, part: string) -> Result[Option[Value], string]
+    if !c.has_value then return Ok(None)
+
+    val v = c.value
+
+    c.kind match
+        "s" ->
+            val i = parse_long_base(v, 10) match
+                Ok(n) -> n
+                Err(_) -> return Err(s"${part}: ${addr}: '${v}' is not a shared-string index")
+
+            if i < 0 || i >= long(strings.len()) then return Err(s"${part}: ${addr}: shared string ${i} is not in the table")
+
+            Ok(Some(Text(strings[usize(i)])))
+        "str" -> Ok(Some(Text(unescaped(v))))
+        "inlineStr" -> Ok(Some(Text(v)))
+        "b" -> Ok(Some(Bool(v == "1" || to_upper(v) == "TRUE")))
+        "e" ->
+            fault_named(v) match
+                Some(f) -> Ok(Some(Error(f)))
+                None -> Ok(Some(Error(NotAvailable)))
+        "d" -> Ok(Some(Text(v)))
+        _ ->
+            if v.len == 0 then return Ok(None)
+
+            number_of(v) match
+                Some(x) -> Ok(Some(Number(x)))
+                None -> Err(s"${part}: ${addr}: '${v}' is not a number")
+end cached_value
+
+// The input that gives a cell this constant.
+input_of(v: Value) -> string
+    v match
+        Number(x) -> shortest_text(x)
+        Text(t) -> text_input(t)
+        _ -> v.display()
+
+// A formula with Excel's `_xlfn.`, `_xlws.` and `_xludf.` prefixes taken off its function names.
+private without_prefixes(e: &Expr) -> &Expr
+    *e match
+        Negate(x) -> Negate(without_prefixes(x))
+        Posit(x) -> Posit(without_prefixes(x))
+        PercentOf(x) -> PercentOf(without_prefixes(x))
+        Group(x) -> Group(without_prefixes(x))
+        Binary(op, a, b) -> Binary(op, without_prefixes(a), without_prefixes(b))
+        Call(name, args) ->
+            var out: Buf[&Expr] = buf()
+
+            for i in 0..<args.len()
+                out.push(without_prefixes(args.at(i)))
+
+            var bare = name
+
+            if name.starts_with("_XLFN.") || name.starts_with("_XLWS.") then bare = name[6..]
+            if name.starts_with("_XLUDF.") then bare = name[7..]
+
+            Call(bare, out)
+        _ -> e
+end without_prefixes
+
+// A formula with `_xlfn.` put in front of the functions newer than 2007, as Excel writes them.
+private with_prefixes(e: &Expr) -> &Expr
+    *e match
+        Negate(x) -> Negate(with_prefixes(x))
+        Posit(x) -> Posit(with_prefixes(x))
+        PercentOf(x) -> PercentOf(with_prefixes(x))
+        Group(x) -> Group(with_prefixes(x))
+        Binary(op, a, b) -> Binary(op, with_prefixes(a), with_prefixes(b))
+        Call(name, args) ->
+            var out: Buf[&Expr] = buf()
+
+            for i in 0..<args.len()
+                out.push(with_prefixes(args.at(i)))
+
+            var newer = false
+
+            for n in NEWER_FUNCTIONS
+                if n == name then newer = true
+
+            Call(if newer then "_xlfn." + name else name, out)
+        _ -> e
+end with_prefixes
+
+// Text with OOXML's `_xHHHH_` escapes replaced by the characters they stand for: how a file carries a
+// control character XML cannot, and `_x005F_` in front of an `_x` that is really there.
+unescaped(t: string) -> string
+    if !t.contains("_x") then return t
+
+    val b = t.bytes
+    var sb = str_builder()
+    var i: usize = 0
+
+    while i < b.len
+        if i + 7 <= b.len && b[i] == u8('_') && b[i + 1] == u8('x') && b[i + 6] == u8('_')
+            parse_long_base(t[i + 2..<i + 6], 16) match
+                Ok(n) ->
+                    sb.push_char(char(u32(n)))
+                    i += 7
+                    continue
+                Err(_) -> ()
+
+        sb.bytes.push(b[i])
+        i += 1
+
+    sb.finish()
+end unescaped
+
+// Text with what XML cannot carry -- a control character other than tab and line feed -- written as
+// `_xHHHH_`, and an `_x` that would read as such an escape guarded with `_x005F_`.
+escaped(t: string) -> string
+    var plain = true
+
+    for c in t.bytes
+        if (c < 0x20 && c != u8('\t') && c != u8('\n')) || c == u8('_') then plain = false
+
+    if plain then return t
+
+    val b = t.bytes
+    var sb = str_builder()
+
+    for i in 0..<b.len
+        val c = b[i]
+
+        if c < 0x20 && c != u8('\t') && c != u8('\n')
+            sb.push(f"_x${c}%04X_")
+        elif c == u8('_') && i + 7 <= b.len && b[i + 1] == u8('x') && b[i + 6] == u8('_') && is_hex4(t[i + 2..<i + 6])
+            sb.push("_x005F_")
+        else
+            sb.bytes.push(c)
+
+    sb.finish()
+end escaped
+
+private is_hex4(t: string) -> bool = parse_long_base(t, 16).is_ok()
+
+// --- Writing -------------------------------------------------------------------------------------------
+
+private val CONTENT_TYPES = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/><Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/><Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/><Override PartName=\"/xl/sharedStrings.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml\"/><Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/></Types>"
+
+private val PACKAGE_RELATIONSHIPS = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/></Relationships>"
+
+private val WORKBOOK_RELATIONSHIPS = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/><Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/><Relationship Id=\"rId3\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings\" Target=\"sharedStrings.xml\"/></Relationships>"
+
+private val STYLES = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><fonts count=\"1\"><font><sz val=\"11\"/><name val=\"Calibri\"/><family val=\"2\"/></font></fonts><fills count=\"2\"><fill><patternFill patternType=\"none\"/></fill><fill><patternFill patternType=\"gray125\"/></fill></fills><borders count=\"1\"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/></cellStyleXfs><cellXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/></cellXfs><cellStyles count=\"1\"><cellStyle name=\"Normal\" xfId=\"0\" builtinId=\"0\"/></cellStyles></styleSheet>"
+
+// A sheet as an `.xlsx` package of one worksheet.
+write_xlsx(s: Sheet) -> Result[Buf[u8], string]
+    var strings: Buf[string] = buf()
+    var index: Map[string, int] = map()
+    val sheet_xml = worksheet_xml(s, &strings, &index)?
+    var uses: usize = 0
+
+    for (_, slot) in s.cells
+        slot.content match
+            Constant(Text(_)) -> uses += 1
+            _ -> ()
+
+    var z = zip_writer()
+
+    z.add("[Content_Types].xml", CONTENT_TYPES.bytes).map_err(e -> e.to_string())?
+    z.add("_rels/.rels", PACKAGE_RELATIONSHIPS.bytes).map_err(e -> e.to_string())?
+    z.add("xl/workbook.xml", workbook_xml(s.name)?.bytes).map_err(e -> e.to_string())?
+    z.add("xl/_rels/workbook.xml.rels", WORKBOOK_RELATIONSHIPS.bytes).map_err(e -> e.to_string())?
+    z.add("xl/styles.xml", STYLES.bytes).map_err(e -> e.to_string())?
+    z.add("xl/sharedStrings.xml", strings_xml(strings, uses)?.bytes).map_err(e -> e.to_string())?
+    z.add("xl/worksheets/sheet1.xml", sheet_xml.bytes).map_err(e -> e.to_string())?
+    Ok(z.finish())
+end write_xlsx
+
+private workbook_xml(name: string) -> Result[string, string]
+    var w = xml_writer()
+
+    w.declaration(Some(true))
+    w.open("workbook")
+    w.ns("", MAIN)
+    w.ns("r", RELS)
+    w.open("sheets")
+    w.open("sheet")
+    w.attr("name", name)
+    w.attr("sheetId", "1")
+    w.attr("r:id", "rId1")
+    w.close()
+    w.close()
+    w.close()
+    w.finish().map_err(e -> s"xl/workbook.xml: ${e}")
+end workbook_xml
+
+private strings_xml(strings: Buf[string], uses: usize) -> Result[string, string]
+    var w = xml_writer()
+
+    w.declaration(Some(true))
+    w.open("sst")
+    w.ns("", MAIN)
+    w.attr("count", uses.to_string())
+    w.attr("uniqueCount", strings.len().to_string())
+
+    for t in strings
+        w.open("si")
+        w.open("t")
+
+        if t.len > 0 && (is_space(t.bytes[0]) || is_space(t.bytes[t.len - 1])) then w.attr("xml:space", "preserve")
+
+        w.text(escaped(t))
+        w.close()
+        w.close()
+
+    w.close()
+    w.finish().map_err(e -> s"xl/sharedStrings.xml: ${e}")
+end strings_xml
+
+private is_space(c: u8) -> bool = c == u8(' ') || c == u8('\t') || c == u8('\n')
+
+// The worksheet part: dimension, column widths, and the cells in row order, each string put into the
+// shared table the first time it is met.
+private worksheet_xml(s: Sheet, strings: *Buf[string], index: *Map[string, int]) -> Result[string, string]
+    var keys: Buf[long] = buf()
+
+    for (k, _) in s.cells
+        keys.push(k)
+
+    sort(keys.view())
+
+    var w = xml_writer()
+
+    w.declaration(Some(true))
+    w.open("worksheet")
+    w.ns("", MAIN)
+    w.ns("r", RELS)
+
+    if keys.len() > 0
+        var last_col = 0
+
+        for k in keys
+            last_col = last_col.max(col_of(k))
+
+        val last = column_name(last_col) + (row_of(keys[keys.len() - 1]) + 1).to_string()
+
+        w.open("dimension")
+        w.attr("ref", if last == "A1" then "A1" else "A1:" + last)
+        w.close()
+
+    write_widths(s, &w)
+    w.open("sheetData")
+
+    var row = -1
+
+    for k in keys
+        val r = row_of(k)
+
+        if r != row
+            if row >= 0 then w.close()
+
+            w.open("row")
+            w.attr("r", (r + 1).to_string())
+            row = r
+
+        val slot = s.cells.get(k).unwrap()
+
+        w.open("c")
+        w.attr("r", column_name(col_of(k)) + (r + 1).to_string())
+
+        slot.content match
+            Constant(v) -> write_constant(v, &w, strings, index)
+            Formula(e) -> write_formula(e, slot.value, &w)
+
+        w.close()
+
+    if row >= 0 then w.close()
+
+    w.close()
+    w.close()
+    w.finish().map_err(e -> s"xl/worksheets/sheet1.xml: ${e}")
+end worksheet_xml
+
+// The columns given widths of their own, a run of neighbours of one width as one `<col>`.
+private write_widths(s: Sheet, w: *XmlWriter)
+    var cols: Buf[int] = buf()
+
+    for (c, _) in s.widths
+        cols.push(c)
+
+    if cols.len() == 0 then return
+
+    sort(cols.view())
+    w.open("cols")
+
+    var i: usize = 0
+
+    while i < cols.len()
+        val px = s.widths.get(cols[i]).unwrap()
+        var j = i
+
+        while j + 1 < cols.len() && cols[j + 1] == cols[j] + 1 && s.widths.get(cols[j + 1]).unwrap() == px
+            j += 1
+
+        w.open("col")
+        w.attr("min", (cols[i] + 1).to_string())
+        w.attr("max", (cols[j] + 1).to_string())
+        w.attr("width", shortest_text(width_to_excel(px)))
+        w.attr("customWidth", "1")
+        w.close()
+        i = j + 1
+
+    w.close()
+end write_widths
+
+private write_constant(v: Value, w: *XmlWriter, strings: *Buf[string], index: *Map[string, int])
+    v match
+        Number(x) -> w.element("v", shortest_text(x))
+        Text(t) ->
+            val i = index.get(t) match
+                Some(got) -> got
+                None ->
+                    val n = int(strings.len())
+
+                    strings.push(t)
+                    index.put(t, n)
+                    n
+
+            w.attr("t", "s")
+            w.element("v", i.to_string())
+        Bool(b) ->
+            w.attr("t", "b")
+            w.element("v", if b then "1" else "0")
+        Error(f) ->
+            w.attr("t", "e")
+            w.element("v", f.text())
+        Empty -> ()
+end write_constant
+
+// A formula, without its `=`, and the value abax worked out for it, typed. A circular reference has
+// no code Excel knows, and nothing is cached for it.
+private write_formula(e: &Expr, v: Value, w: *XmlWriter)
+    v match
+        Text(_) -> w.attr("t", "str")
+        Bool(_) -> w.attr("t", "b")
+        Error(Circular) -> ()
+        Error(_) -> w.attr("t", "e")
+        Number(x) -> if !x.is_finite() then w.attr("t", "e")
+        Empty -> ()
+
+    w.element("f", formula_text(with_prefixes(e)))
+
+    v match
+        Number(x) -> w.element("v", if x.is_finite() then shortest_text(x) else "#NUM!")
+        Text(t) -> w.element("v", escaped(t))
+        Bool(b) -> w.element("v", if b then "1" else "0")
+        Error(Circular) -> ()
+        Error(f) -> w.element("v", f.text())
+        Empty -> ()
+end write_formula
