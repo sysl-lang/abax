@@ -1,0 +1,122 @@
+@tests
+
+import sh.sysl.abax.{Sheet, Loaded, open_bytes, read_xlsx, sheet}
+import sysl.buf.{Buf, buf}
+import sysl.fs.read_bytes
+
+// A fixture's bytes from the repository's testdata/, found from the repository root (where
+// `sysl test .` runs) or from cli/ (where `sysl test` in cli/ does).
+private fixture_bytes(name: string) -> []u8
+    read_bytes("testdata/" + name) match
+        Ok(b) -> b
+        Err(_) -> read_bytes("../testdata/" + name).unwrap()
+
+private fixture(name: string) -> Loaded = open_bytes(name, fixture_bytes(name)).unwrap()
+
+private failure(name: string) -> string = open_bytes(name, fixture_bytes(name)).unwrap_err()
+
+@test("an Excel-style package: shared formulas, rich text, escapes, inline strings, a second sheet")
+excel_style()
+    val got = fixture("excel_style.xlsx")
+    val lines = dump(got.sheet)
+
+    assert_eq(got.notes.len(), 2)
+    assert_eq(got.notes[0], "only the first sheet, 'Budget', was read, since abax has one sheet; left out: 'Notes'")
+    assert(got.notes[1].starts_with("array formulas were read as ordinary formulas"))
+    assert_eq(got.sheet.name, "Budget")
+    assert_eq(lines.len(), 22)
+    assert_eq(lines[0], "A1\t0.0015\t0.0015")
+    assert_eq(lines[1], "B1\t=A1*2\t0.003")
+    assert_eq(lines[3], "D1\t=$A$1+B1\t0.006")
+    assert_eq(lines[5], "F1\t=CONCAT(E1,\"!\")\tItem!")
+    assert_eq(lines[9], "D2\t=$A$1+B2\t4.0045")
+    assert_eq(lines[10], "E2\trich text\trich text")
+    assert_eq(lines[13], "B3\t=A3*2\t6")
+    // A cell with no `r` is the one after the last.
+    assert_eq(lines[14], "C3\t7\t7")
+    assert_eq(lines[15], "E3\tline\\rbreak and _x0041_ kept\tline\\rbreak and _x0041_ kept")
+    assert_eq(lines[16], "F3\t#N/A\t#N/A")
+    assert_eq(lines[17], "A4\tinline\tinline")
+    assert_eq(lines[18], "B4\t=A4*2\t#VALUE!")
+    // No cached value, so worked out on reading.
+    assert_eq(lines[19], "C4\t=SUM(A1:A3)\t5.0015")
+    assert_eq(lines[20], "D4\t=A1:A2*2\t0.003")
+    assert_eq(lines[21], "E4\t'12\t'12")
+    assert(got.sheet.width(0) == Some(64))
+    assert(got.sheet.width(1) == Some(145))
+    assert(got.sheet.width(2) == Some(145))
+    assert(got.sheet.width(3) == None)
+
+@test("LibreOffice's reading of the Excel-style package gives the same formulas abax expands")
+shared_formulas_agree_with_libreoffice()
+    val ours = fixture("excel_style.xlsx").sheet
+    val theirs = fixture("excel_style.libreoffice.xlsx").sheet
+
+    for addr in ["B1", "B2", "B3", "B4", "C1", "C2", "D1", "D2", "F1", "C4"]
+        assert_eq(theirs.input(addr), ours.input(addr))
+
+    // LibreOffice writes the logical and the error constants as formulas of themselves.
+    assert_eq(theirs.input("F2"), "=TRUE()")
+    assert_eq(theirs.input("F3"), "=#N/A")
+    assert(theirs.value("F2") == ours.value("F2"))
+
+@test("a LibreOffice workbook: rich text, entities, typed results, widths, and three sheets")
+libreoffice_workbook()
+    val got = fixture("libreoffice.xlsx")
+    val s = got.sheet
+
+    assert_eq(s.name, "Data")
+    assert_eq(got.notes[0], "only the first sheet, 'Data', was read, since abax has one sheet; left out: 'Second', 'Third sheet'")
+    assert_eq(s.display("C1"), "plain bold end")
+    assert_eq(s.display("C2"), "café & <tags>")
+    assert_eq(s.input("C3"), "TRUE")
+    assert_eq(s.input("C4"), "=CONCATENATE(\"n=\",A4)")
+    assert_eq(s.display("C4"), "n=4")
+    assert_eq(s.display("C5"), "#DIV/0!")
+    assert_eq(s.input("D5"), "=SUM($A$1:A5)")
+    assert_eq(s.display("D5"), "15")
+    assert(s.width(0) == Some(182))
+    assert_eq(s.count(), 20)
+
+@test("malformed fixtures are refused, each saying what is wrong")
+malformed_fixtures()
+    assert_eq(failure("not_xlsx.xlsx"), "not an .xlsx file: it has no [Content_Types].xml")
+    assert_eq(failure("no_sheet_part.xlsx"), "the package has no part 'xl/worksheets/sheet2.xml'")
+    assert(failure("bad_xml.xlsx").contains("does not close `<row>`"))
+    assert_eq(failure("out_of_range.xlsx"), "xl/worksheets/sheet2.xml: 'XFE4' is not a cell on the sheet")
+
+@test("show prints what the named cells show, or every stored cell with its address")
+show_cells()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "=1/3").unwrap()
+    s.set("B2", "x\ty").unwrap()
+
+    val named: Buf[string] = buf()
+    var two: Buf[string] = buf()
+
+    two.push("A1")
+    two.push("C9")
+
+    val every = show(s, named)
+
+    assert_eq(every.len(), 2)
+    assert_eq(every[0], "A1\t0.333333333")
+    assert_eq(show(s, two)[0], "0.333333333")
+    assert_eq(show(s, two)[1], "")
+
+@test("dump writes every cell's input and exact value, with text that reads as something else marked")
+dump_cells()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "=1/3").unwrap()
+    s.set("A2", "'12").unwrap()
+    s.set("A3", "=\"a\"&\"\\\"").unwrap()
+    s.set("B1", "two\nlines").unwrap()
+
+    val lines = dump(s)
+
+    assert_eq(lines[0], "A1\t=1/3\t0.3333333333333333")
+    assert_eq(lines[1], "B1\ttwo\\nlines\ttwo\\nlines")
+    assert_eq(lines[2], "A2\t'12\t'12")
+    assert_eq(lines[3], "A3\t=\"a\"&\"\\\\\"\ta\\\\")

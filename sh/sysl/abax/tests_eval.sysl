@@ -415,3 +415,26 @@ nested_lookups()
 
     assert_eq(shows(s, "INDEX(C1:C4,MATCH(\"date\",B1:B4,0))"), "2")
     assert_eq(shows(s, "VLOOKUP(INDEX(A1:A4,2),A1:C4,2,FALSE)"), "Banana")
+
+// Found by the LibreOffice oracle: abax compared the sum's last bit.
+@test("numbers within one part in 2^48 compare equal, as Excel and LibreOffice take them")
+approximate_equality()
+    assert_eq(calc("0.1+0.2=0.3"), "TRUE")
+    assert_eq(calc("0.1+0.2<>0.3"), "FALSE")
+    assert_eq(calc("0.1+0.2>0.3"), "FALSE")
+    assert_eq(calc("0.1+0.2<=0.3"), "TRUE")
+    assert_eq(calc("1+1E-15=1"), "TRUE")
+    assert_eq(calc("1+1E-13=1"), "FALSE")
+    assert_eq(calc("1+1E-13>1"), "TRUE")
+    assert_eq(calc("0=1E-300"), "FALSE")
+    assert_eq(calc("-0.3=-(0.1+0.2)"), "TRUE")
+
+// Found by the LibreOffice oracle: LibreOffice writes every logical into an .xlsx as TRUE() or FALSE().
+@test("TRUE() and FALSE() are the logicals, and take no arguments")
+logical_functions()
+    assert_eq(calc("TRUE()"), "TRUE")
+    assert_eq(calc("FALSE()"), "FALSE")
+    assert_eq(calc("AND(TRUE(),NOT(FALSE()))"), "TRUE")
+    assert_eq(calc("TRUE()+1"), "2")
+    assert_eq(calc("TRUE(1)").starts_with("error: "), true)
+    assert_eq(calc("TRUE"), "TRUE")

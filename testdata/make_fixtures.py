@@ -1,6 +1,6 @@
 """Writes the .xlsx fixtures that are not LibreOffice's, byte for byte as Excel lays them out:
 
-    python3 -I tests/make_fixtures.py tests
+    python3 -I testdata/make_fixtures.py testdata
 
 - `excel_style.xlsx`: what Excel writes and LibreOffice does not -- shared formulas (a column and a
   block), `_xlfn.` prefixes, rich text with a phonetic guide, `_xHHHH_` escapes, inline strings, cells
@@ -10,8 +10,12 @@
   `no_sheet_part.xlsx` (the workbook names a part that is not there), `bad_xml.xlsx` (the sheet does
   not close a tag), `out_of_range.xlsx` (a cell past XFD).
 
-`excel_style.libreoffice.xlsx` is LibreOffice's reading of `excel_style.xlsx`, written again: its
-shared formulas are expanded by LibreOffice, so abax's expansion is checked against another reader.
+The two made by LibreOffice (headless, with a private profile, as oracle/oracle.zsh runs it):
+
+- `libreoffice.xlsx` from `libreoffice.fods` -- rich text, entities, typed formula results, a width,
+  three sheets: `soffice --headless --convert-to "xlsx:Calc MS Excel 2007 XML" libreoffice.fods`.
+- `excel_style.libreoffice.xlsx`, LibreOffice's reading of `excel_style.xlsx` written again: its
+  shared formulas expanded by LibreOffice, so abax's expansion is checked against another reader.
 """
 
 import os

@@ -1,0 +1,367 @@
+module sh.sysl.abax
+@tests
+
+import sysl.buf.{Buf, buf}
+import sh.sysl.zip.{open as zip_open, writer as zip_writer}
+
+// --- CSV -------------------------------------------------------------------------------------------
+
+private csv(text: string) -> Sheet = read_csv(text.bytes).unwrap()
+
+@test("a CSV field is read as if typed: numbers, logicals, errors and text")
+csv_typed_fields()
+    val s = csv("1,2.5,TRUE,#N/A,hello, 7 ,25%\n")
+
+    assert(s.value("A1") == Number(1.0))
+    assert(s.value("B1") == Number(2.5))
+    assert(s.value("C1") == Bool(true))
+    assert(s.value("D1") == Error(NotAvailable))
+    assert(s.value("E1") == Text("hello"))
+    assert(s.value("F1") == Number(7.0))
+    assert(s.value("G1") == Number(0.25))
+    assert(s.count() == 7)
+
+@test("a quoted CSV field keeps its separators, doubled quotes and line breaks")
+csv_quoted_fields()
+    val s = csv("\"a,b\",\"say \"\"hi\"\"\",\"two\nlines\",\"\"\nnext,\"\r\n\"\n")
+
+    assert(s.value("A1") == Text("a,b"))
+    assert(s.value("B1") == Text("say \"hi\""))
+    assert(s.value("C1") == Text("two\nlines"))
+    assert(s.value("D1") == Empty)
+    assert(s.value("A2") == Text("next"))
+    assert(s.value("B2") == Text("\r\n"))
+
+@test("CSV lines end at CRLF, LF or CR, a final line break makes no row, and a BOM is dropped")
+csv_line_ends()
+    val s = csv("\u{FEFF}a,b\r\nc\rd\n\ne\n")
+
+    assert(s.value("A1") == Text("a"))
+    assert(s.value("B1") == Text("b"))
+    assert(s.value("A2") == Text("c"))
+    assert(s.value("A3") == Text("d"))
+    assert(s.value("A4") == Empty)
+    assert(s.value("A5") == Text("e"))
+    assert(s.count() == 5)
+    assert_eq(s.input("A1"), "a")
+
+@test("a CSV field starting with = is text unless formulas are asked for")
+csv_formulas_are_an_option()
+    val plain = csv("2,=A1*3,'quoted,=\n")
+
+    assert(plain.value("B1") == Text("=A1*3"))
+    assert_eq(plain.input("B1"), "'=A1*3")
+    assert(plain.value("C1") == Text("'quoted"))
+    assert(plain.value("D1") == Text("="))
+
+    val f = read_csv("2,=A1*3,=SUM(,'x\n".bytes, u8(','), true).unwrap()
+
+    assert(f.value("B1") == Number(6.0))
+    assert_eq(f.formula("B1").unwrap(), "=A1*3")
+    // A formula that does not parse is kept as the text it was.
+    assert(f.value("C1") == Text("=SUM("))
+    assert(f.value("D1") == Text("'x"))
+
+@test("the CSV separator may be a semicolon or a tab")
+csv_separators()
+    val semi = read_csv("1;\"a;b\";2,5\n".bytes, u8(';')).unwrap()
+
+    assert(semi.value("A1") == Number(1.0))
+    assert(semi.value("B1") == Text("a;b"))
+    assert(semi.value("C1") == Text("2,5"))
+    assert_eq(write_csv(semi, u8(';')), "1;\"a;b\";2,5\r\n")
+
+    val tab = read_csv("x\ty,z\n".bytes, u8('\t')).unwrap()
+
+    assert(tab.value("B1") == Text("y,z"))
+    assert_eq(write_csv(tab, u8('\t')), "x\ty,z\r\n")
+
+@test("reading a CSV is not a step to undo, and its formulas are worked out")
+csv_is_not_undoable()
+    var s = read_csv("1,=A1+1\n".bytes, u8(','), true).unwrap()
+
+    assert(s.value("B1") == Number(2.0))
+    assert(!s.undo())
+    s.set("A1", "5").unwrap()
+    assert(s.value("B1") == Number(6.0))
+
+@test("bytes that are not UTF-8 are refused, saying where")
+csv_not_utf8()
+    val bad: [4]u8 = [u8('a'), 0xFF, u8(','), u8('b')]
+
+    assert_eq(read_csv(bad[..]).unwrap_err(), "the file is not UTF-8 text: byte 1 is not part of a character")
+    assert_eq(read_csv("".bytes).unwrap().count(), 0)
+
+@test("a sheet is written as CSV: values, the shortest numbers, quoting where needed, CRLF")
+csv_write()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "=1/3").unwrap()
+    s.set("C1", "a,b").unwrap()
+    s.set("A2", "say \"hi\"").unwrap()
+    s.set("B2", "TRUE").unwrap()
+    s.set("C2", "=1/0").unwrap()
+    s.set("B3", "two\nlines").unwrap()
+    s.set("C3", "1e300").unwrap()
+
+    assert_eq(write_csv(s), "0.3333333333333333,,\"a,b\"\r\n\"say \"\"hi\"\"\",TRUE,#DIV/0!\r\n,\"two\nlines\",1e+300\r\n")
+    assert_eq(write_csv(sheet("Sheet1")), "")
+
+@test("a CSV round trip keeps every value; text that reads as a number does not stay text")
+csv_round_trip()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "0.1").unwrap()
+    s.set("B1", "=0.1+0.2").unwrap()
+    s.set("C1", "-1.5e-7").unwrap()
+    s.set("A2", "x, \"y\"\r\nz").unwrap()
+    s.set("B2", "=1=1").unwrap()
+    s.set("C2", "'007").unwrap()
+    s.set("D2", "'=A1").unwrap()
+
+    val back = csv(write_csv(s))
+
+    assert(back.value("A1") == Number(0.1))
+    assert(back.value("B1") == s.value("B1"))
+    assert(back.value("C1") == Number(-1.5e-7))
+    assert(back.value("A2") == Text("x, \"y\"\r\nz"))
+    assert(back.value("B2") == Bool(true))
+    assert(back.value("C2") == Number(7.0))
+    assert(back.value("D2") == Text("=A1"))
+
+@test("text_input makes an input that gives back exactly that text")
+text_inputs()
+    for t in ["plain", "12", " 3 ", "TRUE", "#N/A", "=A1", "'q", "", "=", "50%"]
+        var s = sheet("Sheet1")
+
+        s.set("A1", text_input(t)).unwrap()
+        assert(s.value("A1") == Text(t))
+
+    assert_eq(text_input("plain"), "plain")
+    assert_eq(text_input("12"), "'12")
+
+// --- .xlsx -----------------------------------------------------------------------------------------
+
+// A sheet with something of every kind in it.
+private sample() -> Sheet
+    var s = sheet("Budget")
+
+    s.set("A1", "Item").unwrap()
+    s.set("B1", "1.5").unwrap()
+    s.set("C1", "=B1*2").unwrap()
+    s.set("D1", "=CONCAT(A1,\"!\")").unwrap()
+    s.set("A2", "  padded ").unwrap()
+    s.set("B2", "TRUE").unwrap()
+    s.set("C2", "=B1>1").unwrap()
+    s.set("D2", "=1/0").unwrap()
+    s.set("A3", "Item").unwrap()
+    s.set("B3", "#N/A").unwrap()
+    s.set("C3", "=A3&\" \"&B1").unwrap()
+    s.set("D3", "'123").unwrap()
+    s.set("A4", "a < b & \"c\"").unwrap()
+    s.set("B4", "=SUM(B1:B3,C:C)").unwrap()
+    s.set("C4", "=C4+1").unwrap()
+    s.set("D4", "=FOO(1)").unwrap()
+    s.set("E5", "ctrl\u{1}char _x0041_").unwrap()
+    s.set("XFD1048576", "0.1").unwrap()
+    s.set_width(0, 120)
+    s.set_width(1, 90)
+    s.set_width(2, 90)
+    s.set_width(4, 64)
+    s
+end sample
+
+private reread(s: Sheet) -> Loaded = read_xlsx(write_xlsx(s).unwrap().view()).unwrap()
+
+@test("an .xlsx round trip gives back every input and every value")
+xlsx_round_trip()
+    val s = sample()
+    val got = reread(s)
+    val t = got.sheet
+
+    assert_eq(got.notes.len(), 0)
+    assert_eq(t.name, "Budget")
+    assert_eq(t.count(), s.count())
+
+    for (k, slot) in s.cells
+        assert_eq(t.input_at(k), slot.input)
+        assert(t.value_at(col_of(k), row_of(k)) == slot.value)
+
+    assert(t.value("C4") == Error(Circular))
+    assert(t.value("D4") == Error(BadName))
+    assert(t.value("E5") == Text("ctrl\u{1}char _x0041_"))
+    assert(t.width(0) == Some(120))
+    assert(t.width(1) == Some(90))
+    assert(t.width(2) == Some(90))
+    assert(t.width(3) == None)
+    assert(t.width(4) == Some(64))
+
+@test("formulas come back with their cached values, not worked out again")
+xlsx_keeps_cached_values()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "2").unwrap()
+    s.set("B1", "=A1*10").unwrap()
+
+    val bytes = write_xlsx(s).unwrap()
+    var t = read_xlsx(bytes.view()).unwrap().sheet
+
+    assert(t.value("B1") == Number(20.0))
+    assert_eq(t.evaluations, 0)
+    assert(!t.undo())
+    t.set("A1", "3").unwrap()
+    assert(t.value("B1") == Number(30.0))
+
+@test("the same sheet is written as the same bytes")
+xlsx_deterministic()
+    val a = write_xlsx(sample()).unwrap()
+    val b = write_xlsx(sample()).unwrap()
+
+    assert(a.view() == b.view())
+
+@test("the package holds the parts Excel needs, and the sheet is typed as Excel types it")
+xlsx_parts()
+    val bytes = write_xlsx(sample()).unwrap()
+    val zip = zip_open(bytes.view()).unwrap()
+    var names: Buf[string] = buf()
+
+    for e in zip.entries
+        names.push(e.name)
+
+    assert_eq(names.len(), 7)
+    assert(zip.find("[Content_Types].xml").is_some())
+    assert(zip.find("xl/styles.xml").is_some())
+
+    val sheet_xml = string_of(zip.read(zip.find("xl/worksheets/sheet1.xml").unwrap()).unwrap())
+
+    assert(sheet_xml.contains("<dimension ref=\"A1:XFD1048576\"/>"))
+    assert(sheet_xml.contains("<col min=\"2\" max=\"3\" width=\"12.85546875\" customWidth=\"1\"/>"))
+    assert(sheet_xml.contains("<c r=\"C1\"><f>B1*2</f><v>3</v></c>"))
+    assert(sheet_xml.contains("<c r=\"D1\" t=\"str\"><f>_xlfn.CONCAT(A1,&quot;!&quot;)</f><v>Item!</v></c>")
+        || sheet_xml.contains("<c r=\"D1\" t=\"str\"><f>_xlfn.CONCAT(A1,\"!\")</f><v>Item!</v></c>"))
+    assert(sheet_xml.contains("<c r=\"C2\" t=\"b\"><f>B1&gt;1</f><v>1</v></c>"))
+    assert(sheet_xml.contains("<c r=\"D2\" t=\"e\"><f>1/0</f><v>#DIV/0!</v></c>"))
+    assert(sheet_xml.contains("<c r=\"B3\" t=\"e\"><v>#N/A</v></c>"))
+    assert(sheet_xml.contains("<c r=\"C4\"><f>C4+1</f></c>"))
+    assert(sheet_xml.contains("<c r=\"A1\" t=\"s\"><v>0</v></c>"))
+    assert(sheet_xml.contains("<c r=\"A3\" t=\"s\"><v>0</v></c>"))
+
+    val strings = string_of(zip.read(zip.find("xl/sharedStrings.xml").unwrap()).unwrap())
+
+    assert(strings.contains("count=\"6\" uniqueCount=\"5\""))
+    assert(strings.contains("<t xml:space=\"preserve\">  padded </t>"))
+    assert(strings.contains("<t>ctrl_x0001_char _x005F_x0041_</t>"))
+
+private string_of(b: Buf[u8]) -> string = sysl.text.from_utf8(b.view()).unwrap()
+
+@test("column widths convert by Excel's rule for its 7-pixel digit")
+xlsx_widths()
+    assert_eq(width_from_excel(9.140625), 64)
+    assert_eq(width_from_excel(8.43), 59)
+    assert_eq(width_from_excel(20.7109375), 145)
+    assert(width_to_excel(64) == 9.140625)
+
+    for px in 8..400
+        assert_eq(width_from_excel(width_to_excel(px)), px)
+
+@test("_xHHHH_ escapes are read and written, and a real _x is guarded")
+xlsx_escapes()
+    assert_eq(unescaped("a_x000D_b"), "a\rb")
+    assert_eq(unescaped("_x005F_x0041_"), "_x0041_")
+    assert_eq(unescaped("_xZZZZ_ and _x12"), "_xZZZZ_ and _x12")
+    assert_eq(escaped("a\u{1}b"), "a_x0001_b")
+    assert_eq(escaped("_x0041_"), "_x005F_x0041_")
+    assert_eq(escaped("tab\tnew\nline_x"), "tab\tnew\nline_x")
+
+    for t in ["plain", "a\rb", "_x0041_", "\u{1F}\u{1}", "_x005F_"]
+        assert_eq(unescaped(escaped(t)), t)
+
+// A package of the given parts, for the malformed ones.
+private package(parts: []const (string, string)) -> Buf[u8]
+    var z = zip_writer()
+
+    for p in parts
+        z.add(p.0, p.1.bytes).unwrap()
+
+    z.finish()
+end package
+
+private val TYPES = "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"/>"
+private val BOOK = "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><sheets><sheet name=\"S\" sheetId=\"1\" r:id=\"rId1\"/></sheets></workbook>"
+private val BOOK_RELS = "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/></Relationships>"
+
+private with_sheet(sheet_xml: string) -> Buf[u8] =
+    package([("[Content_Types].xml", TYPES), ("xl/workbook.xml", BOOK), ("xl/_rels/workbook.xml.rels", BOOK_RELS),
+             ("xl/worksheets/sheet1.xml", sheet_xml)])
+
+private failure(bytes: Buf[u8]) -> string = read_xlsx(bytes.view()).unwrap_err()
+
+@test("a package with no _rels/.rels finds xl/workbook.xml, and a sheet with no r attributes counts")
+xlsx_minimal_package()
+    val got = read_xlsx(with_sheet("<worksheet><sheetData><row><c><v>1</v></c><c t=\"inlineStr\"><is><t>x</t></is></c></row><row><c r=\"C2\" t=\"b\"><v>0</v></c></row></sheetData></worksheet>").view()).unwrap()
+
+    assert_eq(got.sheet.name, "S")
+    assert(got.sheet.value("A1") == Number(1.0))
+    assert(got.sheet.value("B1") == Text("x"))
+    assert(got.sheet.value("C2") == Bool(false))
+
+@test("malformed packages are refused with what is wrong")
+xlsx_malformed()
+    assert(failure(package([("a.txt", "x")])).contains("no [Content_Types].xml"))
+    assert(read_xlsx("not a zip at all".bytes).unwrap_err().starts_with("not an .xlsx file: "))
+    assert_eq(failure(package([("[Content_Types].xml", TYPES), ("xl/workbook.xml", BOOK), ("xl/_rels/workbook.xml.rels", BOOK_RELS)])),
+              "the package has no part 'xl/worksheets/sheet1.xml'")
+    assert_eq(failure(package([("[Content_Types].xml", TYPES)])), "the package has no part 'xl/workbook.xml'")
+    assert_eq(failure(package([("[Content_Types].xml", TYPES), ("xl/workbook.xml", "<workbook/>")])), "xl/workbook.xml names no sheet")
+    assert(failure(package([("[Content_Types].xml", TYPES), ("xl/workbook.xml", BOOK)])).contains("names relationship 'rId1', which is not there"))
+    assert(failure(with_sheet("<worksheet><sheetData><row></sheetData></worksheet>")).starts_with("xl/worksheets/sheet1.xml: 1:"))
+    assert_eq(failure(with_sheet("<worksheet><sheetData><row><c r=\"XFE1\"><v>1</v></c></row></sheetData></worksheet>")),
+              "xl/worksheets/sheet1.xml: 'XFE1' is not a cell on the sheet")
+    assert_eq(failure(with_sheet("<worksheet><sheetData><row r=\"1048577\"/></sheetData></worksheet>")),
+              "xl/worksheets/sheet1.xml: row 1048577 is outside the sheet")
+    assert_eq(failure(with_sheet("<worksheet><sheetData><row><c t=\"s\"><v>0</v></c></row></sheetData></worksheet>")),
+              "xl/worksheets/sheet1.xml: A1: shared string 0 is not in the table")
+    assert_eq(failure(with_sheet("<worksheet><sheetData><row><c><v>abc</v></c></row></sheetData></worksheet>")),
+              "xl/worksheets/sheet1.xml: A1: 'abc' is not a number")
+
+@test("a formula abax cannot read keeps its value and is noted; an unknown function is kept")
+xlsx_unreadable_formula()
+    val got = read_xlsx(with_sheet("<worksheet><sheetData><row><c r=\"A1\"><f>{1,2}</f><v>1</v></c><c r=\"B1\" t=\"e\"><f>_xludf.NOPE(1)</f><v>#NAME?</v></c><c r=\"C1\" t=\"str\"><f>_xlfn.CONCAT(\"a\",\"b\")</f><v>ab</v></c></row></sheetData></worksheet>").view()).unwrap()
+
+    assert_eq(got.sheet.input("A1"), "1")
+    assert_eq(got.notes.len(), 1)
+    assert(got.notes[0].starts_with("A1: abax cannot read the formula ={1,2}"))
+    assert_eq(got.sheet.input("B1"), "=NOPE(1)")
+    assert(got.sheet.value("B1") == Error(BadName))
+    assert_eq(got.sheet.input("C1"), "=CONCAT(\"a\",\"b\")")
+
+@test("a shared formula is copied into each of its cells, moving its relative references")
+xlsx_shared_formulas()
+    val got = read_xlsx(with_sheet("<worksheet><sheetData><row r=\"1\"><c r=\"A1\"><v>1</v></c><c r=\"B1\"><f t=\"shared\" ref=\"B1:C2\" si=\"7\">$A$1+A1</f><v>2</v></c><c r=\"C1\"><f t=\"shared\" si=\"7\"/><v>3</v></c></row><row r=\"2\"><c r=\"B2\"><f t=\"shared\" si=\"7\"/><v>1</v></c><c r=\"C2\"><f t=\"shared\" si=\"7\"/></c><c r=\"D2\"><f t=\"shared\" si=\"9\"/><v>5</v></c></row></sheetData></worksheet>").view()).unwrap()
+    val s = got.sheet
+
+    assert_eq(s.input("B1"), "=$A$1+A1")
+    assert_eq(s.input("C1"), "=$A$1+B1")
+    assert_eq(s.input("B2"), "=$A$1+A2")
+    assert_eq(s.input("C2"), "=$A$1+B2")
+    // C2 had no cached value, so it was worked out: 1 + B2's cached 1.
+    assert(s.value("C2") == Number(2.0))
+    assert(s.value("B2") == Number(1.0))
+    assert(s.value("D2") == Number(5.0))
+    assert_eq(s.input("D2"), "5")
+    assert(got.notes[0].starts_with("D2: its shared formula 9 has no first cell"))
+
+@test("CSV, TSV and .xlsx are told apart by name")
+formats_by_name()
+    assert(format_of("a.CSV") == Some(Csv))
+    assert(format_of("a.tsv") == Some(Tsv))
+    assert(format_of("dir.x/Book.xlsx") == Some(Xlsx))
+    assert(format_of("a.ods") == None)
+    assert(open_bytes("a.ods", "".bytes).unwrap_err() == "'a.ods' is not a .csv, .tsv or .xlsx file")
+
+    val s = open_bytes("x.tsv", "1\t=A1\n".bytes, true).unwrap().sheet
+
+    assert(s.value("B1") == Number(1.0))
+    assert_eq(string_of(save_bytes(s, "x.csv").unwrap()), "1,1\r\n")
+    assert_eq(string_of(save_bytes(s, "x.tsv").unwrap()), "1\t1\r\n")
+    assert(read_xlsx(save_bytes(s, "x.xlsx").unwrap().view()).unwrap().sheet.input("B1") == "=A1")
