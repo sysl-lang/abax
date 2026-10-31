@@ -49,6 +49,19 @@ struct Model
     text: string
     sel: Selection
 
+    // Point mode: whether the reference just before the caret was written by pointing at cells, so
+    // that the next click, drag or arrow replaces it rather than finishing the entry; where its text
+    // starts; and the two ends pointed at, either of which has no row (`-1`) for whole columns or no
+    // column for whole rows.
+    pointing: bool
+    ref_at: usize
+    point_a: Ref
+    point_b: Ref
+
+    // Whether the edit is the formula bar's: typed there, with the bar keeping the keyboard while
+    // cells are pointed at -- a press anywhere takes it from the bar for that one frame.
+    bar_edit: bool
+
     // The line under the grid, and whether it is a complaint.
     message: string
     alert: bool
@@ -72,6 +85,9 @@ struct Model
     name: &Signal[string]
     bar: &Signal[string]
     open: &Signal[int]
+
+    // Whether the About dialog is up. While it is, the grid takes no keys but the two that close it.
+    about: &Signal[bool]
 
     // --- Reading ------------------------------------------------------------------------------------
 
@@ -108,6 +124,7 @@ struct Model
     // average of a selection of more than one cell.
     status(self) -> string
         if self.message.len > 0 then return self.message
+        if self.pointing then return "Point"
 
         val a = self.selection()
 
@@ -237,18 +254,23 @@ struct Model
     // --- Picking with the pointer -------------------------------------------------------------------
 
     // A click on a cell, with shift to stretch the selection to it.
+    // While a formula is being typed with the caret where a reference may go, it writes the cell's
+    // reference instead, and with shift stretches the reference written to a range.
     click(*self, col: int, row: int, stretch: bool)
+        if self.can_point() then return self.point_at(at(col, row), stretch)
         if self.editing && !self.commit() then return
 
         if stretch then self.extend(col, row) else self.go(col, row)
 
-    // A drag across the cells, after the press that began it.
+    // A drag across the cells, after the press that began it: in point mode, the range written.
     drag(*self, col: int, row: int)
-        if self.far_col != col || self.far_row != row then self.extend(col, row)
+        if self.pointing then self.point_at(at(col, row), true)
+        elif self.far_col != col || self.far_row != row then self.extend(col, row)
 
     // A click on a column's letter: the whole column, its first cell active, the grid not scrolled
-    // up or down. With shift, every column from the active one to it.
+    // up or down. With shift, every column from the active one to it. In point mode, `C:C`.
     pick_column(*self, col: int, stretch: bool)
+        if self.can_point() then return self.point_at(Ref(col, -1, false, false), stretch)
         if self.editing && !self.commit() then return
 
         if !stretch then self.col = col.clamp(0, MAX_COLS - 1)
@@ -257,10 +279,13 @@ struct Model
         self.extend(col, MAX_ROWS - 1, down = false)
 
     // A drag along the column letters.
-    drag_column(*self, col: int) = if self.far_col != col then self.extend(col, MAX_ROWS - 1, down = false)
+    drag_column(*self, col: int)
+        if self.pointing then self.point_at(Ref(col, -1, false, false), true)
+        elif self.far_col != col then self.extend(col, MAX_ROWS - 1, down = false)
 
     // A row's number, likewise.
     pick_row(*self, row: int, stretch: bool)
+        if self.can_point() then return self.point_at(Ref(-1, row, false, false), stretch)
         if self.editing && !self.commit() then return
 
         if !stretch then self.row = row.clamp(0, MAX_ROWS - 1)
@@ -268,7 +293,9 @@ struct Model
         self.col = 0
         self.extend(MAX_COLS - 1, row, across = false)
 
-    drag_row(*self, row: int) = if self.far_row != row then self.extend(MAX_COLS - 1, row, across = false)
+    drag_row(*self, row: int)
+        if self.pointing then self.point_at(Ref(-1, row, false, false), true)
+        elif self.far_row != row then self.extend(MAX_COLS - 1, row, across = false)
 
     select_all(*self)
         self.col = 0
@@ -312,9 +339,15 @@ struct Model
 
     // --- Typing -------------------------------------------------------------------------------------
 
-    // A key, while the grid has the keyboard.
+    // A key, while the grid has the keyboard. Under the About dialog only Enter and Escape do
+    // anything, and what they do is close it.
     key(*self, p: Press)
-        if self.editing then self.edit_key(p) else self.move_key(p)
+        if self.about.read()
+            if p.key == Key.Enter || p.key == Key.Escape then self.close_about()
+        elif self.editing
+            self.edit_key(p)
+        else
+            self.move_key(p)
 
     private move_key(*self, p: Press)
         p.key match
@@ -352,22 +385,124 @@ struct Model
             _ -> self.typed(p)
 
     // An arrow while typing: it finishes a cell typed over and moves, and moves the caret in a cell
-    // opened to be changed.
+    // opened to be changed. In a cell typed over with the caret where a reference may go, it points
+    // instead: the reference written moves from the cell being typed into, and with shift stretches.
     private arrow(*self, p: Press, dc: int, dr: int)
         if !self.entering then self.typed(p)
+        elif self.can_point() then self.point_step(dc, dr, p.shift)
         elif self.commit() then self.go(self.col + dc, self.row + dr)
 
+    // Any key but an arrow in point mode ends it: what it types follows the reference rather than
+    // replacing it.
     private typed(*self, p: Press)
         val e = apply(self.text, self.sel, p)
 
         self.text = e.text
         self.sel = e.sel
+        self.pointing = false
         self.bar.set(e.text)
+
+    // --- Pointing -----------------------------------------------------------------------------------
+    //
+    // **Excel's point mode.** While a formula is being typed, a click on a cell, a drag across cells,
+    // a click on a column letter or a row number, or an arrow key in a cell typed over writes the
+    // reference of what it points at into the formula at the caret, rather than finishing the entry.
+    // It does so only where a reference may go: see `pointable`. Once a reference has been written,
+    // the next pointing replaces it, until a key types something after it.
+
+    // Can a reference be pointed into the text being typed, at the caret?
+    can_point(self) -> bool = self.editing && (self.pointing || pointable(self.text, self.sel.lo()))
+
+    // Point at `b`, or with `stretch` at the range from the end pointed at before to `b`.
+    point_at(*self, b: Ref, stretch: bool)
+        val a = if stretch && self.pointing && same_shape(self.point_a, b) then self.point_a else b
+
+        if !self.pointing || a != self.point_a || b != self.point_b then self.write_point(a, b)
+
+    // An arrow in point mode: the far end pointed at moves a step -- from the cell being typed into,
+    // the first time -- and with `stretch` the near end stays.
+    private point_step(*self, dc: int, dr: int, stretch: bool)
+        val from = if self.pointing then self.point_b else at(self.col, self.row)
+        val col = if from.col < 0 then self.left else from.col
+        val row = if from.row < 0 then self.top else from.row
+        val here = at(col, row)
+        val b = at((col + dc).clamp(0, MAX_COLS - 1), (row + dr).clamp(0, MAX_ROWS - 1))
+        val a = if !stretch then b elif self.pointing && same_shape(self.point_a, b) then self.point_a else here
+
+        self.write_point(a, b)
+    end point_step
+
+    // Point at an area, as the name box would name it: whole columns and rows as such.
+    point_area(*self, area: Area)
+        val whole_cols = area.row1 == 0 && area.row2 == MAX_ROWS - 1
+        val whole_rows = area.col1 == 0 && area.col2 == MAX_COLS - 1
+
+        if whole_cols && !whole_rows
+            self.write_point(Ref(area.col1, -1, false, false), Ref(area.col2, -1, false, false))
+        elif whole_rows && !whole_cols
+            self.write_point(Ref(-1, area.row1, false, false), Ref(-1, area.row2, false, false))
+        else
+            self.write_point(at(area.col1, area.row1), at(area.col2, area.row2))
+    end point_area
+
+    // The area pointed at, while in point mode.
+    pointed(self) -> Option[Area] =
+        if self.pointing then Some(area_of(self.point_a, self.point_b)) else None
+
+    // Write the reference from `a` to `b` in place of the one pointed at before, or of the selected
+    // text, and put the caret after it.
+    private write_point(*self, a: Ref, b: Ref)
+        val n = self.text.len
+        val lo = (if self.pointing then self.ref_at else self.sel.lo()).min(n)
+        val hi = (if self.pointing then self.sel.head else self.sel.hi()).min(n).max(lo)
+        val t = reference_text(a, b)
+
+        self.text = s"${self.text[0..<lo]}${t}${self.text[hi..<n]}"
+        self.sel = Selection(lo + t.len, lo + t.len)
+        self.ref_at = lo
+        self.point_a = a
+        self.point_b = b
+        self.pointing = true
+        self.message = ""
+        self.bar.set(self.text)
+        self.follow(if b.col < 0 then self.left else b.col, if b.row < 0 then self.top else b.row)
+    end write_point
+
+    // The formula bar has the keyboard, holding `text` with `sel` selected: the edit is the bar's, and
+    // pointing at cells writes into it. Text or a caret changed in the bar since the last pointing
+    // ends point mode, as a key typed in the cell does.
+    from_bar(*self, text: string, sel: Selection)
+        val n = text.len
+        val s = Selection(sel.anchor.min(n), sel.head.min(n))
+
+        self.bar_edit = true
+
+        if !self.editing
+            self.editing = true
+            self.entering = false
+            self.far_col = self.col
+            self.far_row = self.row
+            self.pointing = false
+        elif text == self.text && s == self.sel
+            return
+
+        self.text = text
+        self.sel = s
+        self.pointing = false
+    end from_bar
+
+    // --- The About dialog ---------------------------------------------------------------------------
+
+    show_about(*self) = self.about.set(true)
+
+    close_about(*self) = self.about.set(false)
 
     // Start typing into the active cell with `text` in it, the caret at its end.
     begin(*self, text: string, entering: bool)
         self.editing = true
         self.entering = entering
+        self.pointing = false
+        self.bar_edit = false
         self.text = text
         self.sel = Selection(text.len, text.len)
         self.far_col = self.col
@@ -390,6 +525,7 @@ struct Model
         self.sheet.set_at(self.col, self.row, self.text) match
             Ok(_) ->
                 self.editing = false
+                self.pointing = false
                 self.message = ""
                 self.alert = false
                 self.edited()
@@ -401,6 +537,7 @@ struct Model
 
     cancel(*self)
         self.editing = false
+        self.pointing = false
         self.message = ""
         self.sync()
 
@@ -409,6 +546,7 @@ struct Model
         self.sheet.set_at(self.col, self.row, text) match
             Ok(_) ->
                 self.editing = false
+                self.pointing = false
                 self.message = ""
                 self.edited()
                 true
@@ -544,6 +682,7 @@ struct Model
         self.clip = None
         self.marked = None
         self.editing = false
+        self.pointing = false
         self.left = 0
         self.top = 0
         self.go(0, 0)
@@ -566,8 +705,8 @@ inside(col: int, row: int) -> bool = col >= 0 && col < MAX_COLS && row >= 0 && r
 // A window's worth of state over an empty sheet.
 model() -> &Model
     val m: &Model = Model(sheet("Sheet1"), 0, 0, 0, 0, 0, 0, 1000, 600, None, "", None, false, false, "",
-                          Selection(0, 0), "", false, -1, 0, 0, false, false, 0, 0, signal("A1"),
-                          signal(""), signal(-1))
+                          Selection(0, 0), false, 0, at(0, 0), at(0, 0), false, "", false, -1, 0, 0, false,
+                          false, 0, 0, signal("A1"), signal(""), signal(-1), signal(false))
     m
 end model
 
@@ -603,3 +742,91 @@ end demo
 private is_empty_value(v: Value) -> bool = v match
     Value.Empty -> true
     _ -> false
+
+// What a reference may follow.
+private const OPENERS: string = "=+-*/^&<>(,:"
+
+// **May a reference be pointed into `text` at `caret`?** Excel's rule, made exact: the text is a
+// formula (it starts with `=`), the caret is not inside quoted text, and the nearest character before
+// the caret that is not a space is `=`, an operator (`+ - * / ^ & < >`, which covers `<=`, `>=` and
+// `<>`), `(`, `,` or `:`. So after `=SUM(` or `=A1+` a click points, and after `=A1`, `=12` or
+// `=SUM(A1)` it finishes the entry as it always has.
+pointable(text: string, caret: usize) -> bool
+    val b = text.bytes
+
+    if text.len == 0 || b[0] != u8('=') || caret > text.len then return false
+
+    var quoted = false
+
+    for k in 0..<caret
+        if b[k] == u8('"') then quoted = !quoted
+
+    if quoted then return false
+
+    var k = caret
+
+    while k > 0 && b[k - 1] == u8(' ')
+        k -= 1
+
+    k > 0 && OPENERS.contains(text[k - 1..<k])
+end pointable
+
+// Are the two ends both cells, both whole columns, or both whole rows?
+private same_shape(a: Ref, b: Ref) -> bool = (a.col < 0) == (b.col < 0) && (a.row < 0) == (b.row < 0)
+
+// The text of the reference from `a` to `b`: one cell `B4`, a range `B4:D8` written from its top left
+// corner, whole columns `C:E` or whole rows `5:7`.
+reference_text(a: Ref, b: Ref) -> string
+    val first = at(a.col.min(b.col), a.row.min(b.row))
+    val last = at(a.col.max(b.col), a.row.max(b.row))
+
+    if first == last && first.col >= 0 && first.row >= 0 then first.text() else s"${first.text()}:${last.text()}"
+
+// A reference in a formula's text: the bytes it takes, and the cells it names.
+struct Span
+    start: usize
+    stop: usize
+    area: Area
+
+// **The references in a formula as typed**, for colouring each one and outlining what it names, as
+// Excel and LibreOffice do. A name followed by `(` is a function, quoted text is text, and a
+// reference into another sheet (`Sheet2!A1`) is not one of this sheet's cells.
+references(text: string) -> Buf[Span]
+    val b = text.bytes
+    var found: Buf[Span] = buf()
+    var quoted = false
+    var k: usize = 0
+
+    while k < text.len
+        if b[k] == u8('"')
+            quoted = !quoted
+            k += 1
+        elif quoted || !ref_byte(b[k])
+            k += 1
+        else
+            var e = k
+
+            while e < text.len && (ref_byte(b[e]) || b[e] == u8(':'))
+                e += 1
+
+            val called = e < text.len && (b[e] == u8('(') || b[e] == u8('!'))
+            val sheet = k > 0 && b[k - 1] == u8('!')
+
+            if !called && !sheet
+                parse_area(text[k..<e]) match
+                    Some(a) -> found.push(Span(k, e, a))
+                    None -> ()
+
+            // Past the whole word, so that the `5` of `1.5` or `1E5` is never read as a row.
+            while e < text.len && (ref_byte(b[e]) || b[e] == u8('.') || b[e] == u8('_'))
+                e += 1
+
+            k = e
+
+    found
+end references
+
+// A byte that may be part of a reference: a letter, a digit, or `$`.
+private ref_byte(c: u8) -> bool =
+    (c >= u8('A') && c <= u8('Z')) || (c >= u8('a') && c <= u8('z')) || (c >= u8('0') && c <= u8('9')) ||
+        c == u8('$')

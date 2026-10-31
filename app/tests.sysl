@@ -1,7 +1,7 @@
 @tests
 
 import sh.sysl.abax.{Value, Area, MAX_COLS, MAX_ROWS}
-import sh.sysl.ui.{View, Recorder, Rect, Key, Press, recorder, render, press, typed, text_field}
+import sh.sysl.ui.{View, Recorder, Rect, Key, Press, Selection, recorder, render, press, typed, text_field}
 import sysl.text.Search
 
 // The grid alone, drawn through a recorder whose font is eight points a character and sixteen a
@@ -832,3 +832,331 @@ width_undo()
     assert(m.sheet.journal.undo.len() == 1)
     m.undo()
     assert_eq(m.width(0), COL_W)
+
+// --- Point mode -------------------------------------------------------------------------------------
+
+// The cell being typed into, A10 on the recorder's grid, with `text` typed over it.
+private typing_at_a10(m: &Model, c: *Recorder, text: string)
+    frame(m, c)
+    click_at(m, c, cx(0), cy(9))
+    m.key(typed(text))
+    frame(m, c)
+
+@test("a reference may follow `=`, an operator, `(`, `,` or `:`, and nothing else")
+the_caret_rule()
+    for t in ["=", "=SUM(", "=A1+", "=A1 - ", "=1*", "=2/", "=2^", "=\"a\"&", "=A1<", "=A1>", "=A1<=",
+              "=A1<>", "=MAX(A1,", "=A1:"]
+        assert(pointable(t, t.len), t)
+
+    for t in ["", "A", "1+", "=12", "=A1", "=SUM(A1)", "=1%", "=TRUE", "=\"a(", "=\"x\" "]
+        assert(!pointable(t, t.len), t)
+
+    // The caret is what counts, not the end of the text.
+    assert(pointable("=SUM()", 5))
+    assert(!pointable("=SUM(A1)", 7))
+
+@test("a click while a formula waits for a reference writes the cell's; another click replaces it")
+point_by_click()
+    val m = model()
+    var c = recorder()
+
+    typing_at_a10(m, &c, "=SUM(")
+    click_at(m, &c, cx(1), cy(3))
+    assert(m.editing && m.pointing)
+    assert_eq(m.text, "=SUM(B4")
+    assert(m.sel == Selection(7, 7))
+    assert_eq(m.bar.read(), "=SUM(B4")
+    assert_eq(m.address(), "A10")
+    assert(m.selection() == Area(0, 9, 0, 9))
+    assert(m.pointed() == Some(Area(1, 3, 1, 3)))
+    assert_eq(m.status(), "Point")
+
+    click_at(m, &c, cx(2), cy(5))
+    assert_eq(m.text, "=SUM(C6")
+
+    // Shift and a click stretch the reference to a range, written from its top left.
+    c.chord.keys = c.chord.keys with { shift = true }
+    click_at(m, &c, cx(1), cy(3))
+    c.chord.keys = c.chord.keys with { shift = false }
+    assert_eq(m.text, "=SUM(B4:C6")
+
+    m.key(typed(")"))
+    assert(!m.pointing)
+    m.key(press(Key.Enter))
+    assert(!m.editing)
+    assert_eq(m.sheet.formula("A10"), Some("=SUM(B4:C6)"))
+    assert(placed(m, 0, 10, 0, 10))
+
+@test("after a number or a `)` a click finishes the entry and selects the cell, as it always has")
+no_point_after_a_value()
+    val m = model()
+    var c = recorder()
+
+    typing_at_a10(m, &c, "=12")
+    click_at(m, &c, cx(1), cy(3))
+    assert(!m.editing && !m.pointing)
+    assert(m.sheet.value("A10") == Value.Number(12.0))
+    assert(placed(m, 1, 3, 1, 3))
+
+    typing_at_a10(m, &c, "=SUM(1)")
+    click_at(m, &c, cx(2), cy(2))
+    assert(!m.editing)
+    assert(m.sheet.value("A10") == Value.Number(1.0))
+    assert(placed(m, 2, 2, 2, 2))
+
+    // Text that is not a formula never points.
+    typing_at_a10(m, &c, "x+")
+    click_at(m, &c, cx(1), cy(1))
+    assert(!m.editing)
+    assert_eq(m.sheet.display("A10"), "x+")
+
+@test("a drag while pointing writes the range, and the range follows the pointer as it goes")
+point_by_drag()
+    val m = model()
+    var c = recorder()
+
+    typing_at_a10(m, &c, "=AVERAGE(")
+    c.point(cx(1), cy(3), true)
+    frame(m, &c)
+    assert_eq(m.text, "=AVERAGE(B4")
+    c.point(cx(2), cy(5), true)
+    frame(m, &c)
+    assert_eq(m.text, "=AVERAGE(B4:C6")
+    c.point(cx(3), cy(7), true)
+    frame(m, &c)
+    assert_eq(m.text, "=AVERAGE(B4:D8")
+
+    // Back over the first cell, the range is one cell again.
+    c.point(cx(1), cy(3), true)
+    frame(m, &c)
+    assert_eq(m.text, "=AVERAGE(B4")
+    c.point(cx(0), cy(1), true)
+    frame(m, &c)
+    c.point(cx(0), cy(1), false)
+    frame(m, &c)
+    assert_eq(m.text, "=AVERAGE(A2:B4")
+    assert(m.editing && m.pointing)
+    assert(placed(m, 0, 9, 0, 9))
+
+@test("arrows point from the cell being typed into, and shift and an arrow stretch to a range")
+point_by_arrows()
+    val m = model()
+
+    m.go(2, 9)
+    m.key(typed("=1+"))
+    m.key(press(Key.Up))
+    assert_eq(m.text, "=1+C9")
+    m.key(press(Key.Up))
+    m.key(press(Key.Left))
+    assert_eq(m.text, "=1+B8")
+    assert(m.pointed() == Some(Area(1, 7, 1, 7)))
+
+    m.key(shift(Key.Up))
+    m.key(shift(Key.Up))
+    m.key(shift(Key.Right))
+    assert_eq(m.text, "=1+B6:C8")
+
+    // A plain arrow again points at one cell, a step from the far end.
+    m.key(press(Key.Down))
+    assert_eq(m.text, "=1+C7")
+
+    // Typing ends point mode: the next arrow finishes the entry and moves from the cell typed into.
+    m.key(typed("*2"))
+    assert(!m.pointing)
+    m.key(press(Key.Right))
+    assert(!m.editing)
+    assert(m.sheet.value("C10") == Value.Number(1.0))
+    assert_eq(m.address(), "D10")
+
+@test("shift and an arrow first stretch from the cell being typed into; an arrow in F2 moves the caret")
+point_stretch_first()
+    val m = model()
+
+    m.go(0, 9)
+    m.key(typed("=SUM("))
+    m.key(shift(Key.Up))
+    m.key(shift(Key.Up))
+    assert_eq(m.text, "=SUM(A8:A10")
+
+    // F2's edit mode moves the caret with the arrows instead, even where a reference may go.
+    m.cancel()
+    m.begin("=1+", false)
+    m.key(press(Key.Left))
+    assert(!m.pointing)
+    assert(m.sel == Selection(2, 2))
+    assert_eq(m.text, "=1+")
+
+@test("a column letter or a row number points at the whole of it, and shift stretches")
+point_by_headers()
+    val m = model()
+    var c = recorder()
+
+    typing_at_a10(m, &c, "=SUM(")
+    click_at(m, &c, cx(2), 10)
+    assert_eq(m.text, "=SUM(C:C")
+    assert(m.pointed() == Some(Area(2, 0, 2, MAX_ROWS - 1)))
+
+    c.chord.keys = c.chord.keys with { shift = true }
+    click_at(m, &c, cx(4), 10)
+    c.chord.keys = c.chord.keys with { shift = false }
+    assert_eq(m.text, "=SUM(C:E")
+
+    click_at(m, &c, 20, cy(4))
+    assert_eq(m.text, "=SUM(5:5")
+
+    c.point(20, cy(4), true)
+    frame(m, &c)
+    c.point(20, cy(2), true)
+    frame(m, &c)
+    c.point(20, cy(2), false)
+    frame(m, &c)
+    assert_eq(m.text, "=SUM(3:5")
+
+    // A cell then replaces the rows, and shift from a cell to a column starts over rather than mixing.
+    click_at(m, &c, cx(1), cy(1))
+    assert_eq(m.text, "=SUM(B2")
+    c.chord.keys = c.chord.keys with { shift = true }
+    click_at(m, &c, cx(3), 10)
+    c.chord.keys = c.chord.keys with { shift = false }
+    assert_eq(m.text, "=SUM(D:D")
+    assert(placed(m, 0, 9, 0, 9))
+
+@test("Escape throws away the whole formula, references pointed at and all")
+point_escape()
+    val m = model()
+    var c = recorder()
+
+    m.sheet.set("A10", "old").unwrap()
+    typing_at_a10(m, &c, "=SUM(")
+    click_at(m, &c, cx(1), cy(3))
+    m.key(press(Key.Escape))
+    assert(!m.editing && !m.pointing)
+    assert_eq(m.sheet.display("A10"), "old")
+    assert(placed(m, 0, 9, 0, 9))
+    assert_eq(m.bar.read(), "old")
+    assert_eq(m.status(), "")
+
+@test("a reference pointed at goes in where the caret is, and replaces what is selected")
+point_mid_text()
+    val m = model()
+
+    m.begin("=SUM(,B2)", false)
+    m.sel = Selection(5, 5)
+    m.click(0, 0, false)
+    assert_eq(m.text, "=SUM(A1,B2)")
+    assert(m.sel == Selection(7, 7))
+
+    m.begin("=1+99", false)
+    m.sel = Selection(3, 5)
+    m.click(2, 2, false)
+    assert_eq(m.text, "=1+C3")
+
+@test("pointing while the formula bar has the keyboard writes into the bar and leaves it the keyboard")
+point_from_the_bar()
+    val m = model()
+    var c = recorder()
+
+    m.go(0, 9)
+    frame(m, &c)
+    m.bar.set("=MAX(")
+    c.take_focus(FORMULA_BAR)
+    c.edit(Selection(5, 5))
+    frame(m, &c)
+    assert(m.editing && !m.entering)
+    assert_eq(m.text, "=MAX(")
+
+    click_at(m, &c, cx(1), cy(3))
+    assert_eq(c.focus(), FORMULA_BAR)
+    assert_eq(m.bar.read(), "=MAX(B4")
+    assert(c.editing() == Selection(7, 7))
+    assert(m.pointing)
+
+    // Typing in the bar ends point mode; then a click finishes the entry as it did before.
+    m.bar.set("=MAX(B4)")
+    c.edit(Selection(8, 8))
+    frame(m, &c)
+    assert(!m.pointing)
+    assert_eq(m.text, "=MAX(B4)")
+    click_at(m, &c, cx(3), cy(1))
+    assert(!m.editing)
+    assert_eq(c.focus(), GRID)
+    assert_eq(m.sheet.formula("A10"), Some("=MAX(B4)"))
+    assert(placed(m, 3, 1, 3, 1))
+
+@test("each reference in the formula typed is found with its cells; functions, text and other sheets are not")
+finding_references()
+    val s = references("=SUM(B4:D8)+A1*$C$3-\"B2\"&LOG10(2)+Sheet2!E5+1.5+C:C+3:4")
+
+    assert_eq(s.len(), 5)
+    assert(s[0].start == 5 && s[0].stop == 10 && s[0].area == Area(1, 3, 3, 7))
+    assert(s[1].start == 12 && s[1].stop == 14 && s[1].area == Area(0, 0, 0, 0))
+    assert(s[2].area == Area(2, 2, 2, 2))
+    assert(s[3].area == Area(2, 0, 2, MAX_ROWS - 1))
+    assert(s[4].area == Area(0, 2, MAX_COLS - 1, 3))
+
+    assert_eq(references("=1E5+2.5").len(), 0)
+
+@test("each reference in the cell being typed is drawn in its colour, its cells outlined to match")
+drawing_references()
+    val m = model()
+    var c = recorder()
+
+    typing_at_a10(m, &c, "=B2+C3*")
+    click_at(m, &c, cx(3), cy(3))
+    assert_eq(count_with(&c, "'='"), 1)
+    assert_eq(count_with(&c, "'B2'"), 1)
+    assert_eq(count_with(&c, "'+'"), 1)
+    assert_eq(count_with(&c, "'C3'"), 1)
+    assert_eq(count_with(&c, "'D4'"), 1)
+
+    // Three outlines in three colours, the one pointed at dashed.
+    assert_eq(count_dashed(&c), 1)
+    assert(has_stroke(&c, REF_COLOURS[0]) && has_stroke(&c, REF_COLOURS[1]) && has_stroke(&c, REF_COLOURS[2]))
+
+    // A cell typed into that is no formula is drawn in one run, as before.
+    m.key(press(Key.Escape))
+    m.key(typed("B2"))
+    frame(m, &c)
+    assert_eq(count_with(&c, "'B2'"), 1)
+    assert_eq(count_dashed(&c), 0)
+
+private has_stroke(c: *Recorder, colour: u32) -> bool
+    for k in 0..<c.ops.len()
+        if c.ops[k].starts_with("stroke ") && c.ops[k].contains(s"#${colour} ") then return true
+
+    false
+
+// How many dashed outlines the frame drew.
+private count_dashed(c: *Recorder) -> int
+    var n = 0
+
+    for k in 0..<c.ops.len()
+        if c.ops[k].starts_with("stroke ") && c.ops[k].contains(" d") then n += 1
+
+    n
+
+// --- The About dialog -------------------------------------------------------------------------------
+
+@test("About opens over the grid, which then takes no keys; Enter or Escape closes it")
+about_dialog()
+    val m = model()
+
+    m.show_about()
+    assert(m.about.read())
+    m.key(press(Key.Right))
+    m.key(typed("x"))
+    m.key(press(Key.Delete))
+    assert(!m.editing)
+    assert(placed(m, 0, 0, 0, 0))
+
+    m.key(press(Key.Enter))
+    assert(!m.about.read())
+    assert(placed(m, 0, 0, 0, 0))
+
+    m.show_about()
+    m.key(press(Key.Escape))
+    assert(!m.about.read())
+
+    // Closed, the grid has its keys back.
+    m.key(press(Key.Right))
+    assert_eq(m.address(), "B1")

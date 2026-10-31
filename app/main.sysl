@@ -1,12 +1,13 @@
 // abax, the application: a sheet in a window, with a menu, a name box, a formula bar and the grid.
 //
 //     abax-app [--demo] [--cell <address>=<input>]... [--cut <range>] [--select <range>]
-//     abax-app [--demo] [--cell <address>=<input>]... [--cut <range>] [--select <range>] --shot <out.png>
+//              [--edit <address>=<text> [--point <range>]] [--about] [--shot <out.png>]
 //
 // `--demo` opens a small budget to look at. `--cell` puts something into a cell, as typing it would,
 // `--cut` cuts a range, as Ctrl-X would but leaving the system clipboard alone, and `--select`
-// selects a cell or a range, so `--shot` — which draws one frame with no window and
-// writes it to a PNG — draws a picture a machine can check.
+// selects a cell or a range. `--edit` leaves a cell being typed into, `--point` points at a range
+// from it as a click and a drag would, and `--about` opens the About dialog -- so `--shot`, which
+// draws one frame with no window and writes it to a PNG, draws a picture a machine can check.
 
 import sh.sysl.ui.{Rect, render, pluto_canvas, fraction}
 import sh.sysl.ui_sdl.{app, run, system_font, stop}
@@ -15,18 +16,21 @@ import sh.sysl.sdl3.{Event, EventKind, KMOD_GUI, KMOD_CTRL, KMOD_SHIFT, SCANCODE
                      SCANCODE_D, SCANCODE_R, SCANCODE_PAGEUP, SCANCODE_PAGEDOWN, SCANCODE_F2,
                      clipboard_text, set_clipboard_text}
 import sh.sysl.plutovg
+import sh.sysl.abax.parse_area
 import sysl.text.Search
 
 const WIDTH: int = 1100
 const HEIGHT: int = 720
 
-const USAGE: string = "usage: abax-app [--demo] [--cell <address>=<input>]... [--cut <range>] [--select <range>] [--shot <out.png>]"
+const USAGE: string = "usage: abax-app [--demo] [--cell <address>=<input>]... [--cut <range>] [--select <range>] [--edit <address>=<text> [--point <range>]] [--about] [--shot <out.png>]"
 
 main(args: []string) -> Result[unit, string]
     val m = model()
     var shot = ""
     var picked = ""
     var cutting = ""
+    var editing = ""
+    var pointing = ""
     var i: usize = 1
 
     while i < args.len
@@ -50,6 +54,15 @@ main(args: []string) -> Result[unit, string]
         elif a == "--cut" && i + 1 < args.len
             cutting = args[i + 1]
             i += 2
+        elif a == "--edit" && i + 1 < args.len
+            editing = args[i + 1]
+            i += 2
+        elif a == "--point" && i + 1 < args.len
+            pointing = args[i + 1]
+            i += 2
+        elif a == "--about"
+            m.show_about()
+            i += 1
         else
             return Err(s"${USAGE} ('${a}' is not one of these)")
 
@@ -60,6 +73,21 @@ main(args: []string) -> Result[unit, string]
         val _ = m.cut()
 
     if picked.len > 0 && !m.jump_to(picked) then return Err(m.message)
+
+    // A cell left being typed into, and a range pointed at from it.
+    if editing.len > 0
+        val eq = editing.index_of("=").ok_or(s"--edit takes <address>=<text>, not '${editing}'")?
+
+        if !m.jump_to(editing[0..<eq]) then return Err(m.message)
+
+        m.begin(editing[eq + 1..<editing.len], true)
+
+    if pointing.len > 0
+        val area = parse_area(pointing).ok_or(s"--point takes a cell or a range, not '${pointing}'")?
+
+        if !m.can_point() then return Err("--point needs --edit with a formula a reference may follow")
+
+        m.point_area(area)
 
     m.sync()
 
@@ -93,7 +121,8 @@ private shortcut(m: &Model, e: Event) -> bool
         m.double = e.mouse_clicks() >= 2u8
         return false
 
-    if kind != EventKind.KeyDown then return false
+    // Under the About dialog no shortcut works: its keys go to the grid, which only closes it.
+    if kind != EventKind.KeyDown || m.about.read() then return false
 
     val key = e.key_scancode()
     val mods = e.key_mod()
@@ -138,8 +167,7 @@ end shortcut
 
 // Copy, cut and paste through the system clipboard, which carries what the cells show as
 // tab-separated text, for other programs; the cells themselves stay in the model, for abax.
-copy_out(m: &Model)
-    val _ = set_clipboard_text(m.copy())
+copy_out(m: &Model) -> unit = set_clipboard_text(m.copy())
 
 cut_out(m: &Model)
     val _ = set_clipboard_text(m.cut())
