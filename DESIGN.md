@@ -81,6 +81,12 @@ Each is a piece of work of its own, in this order.
    deleted), undo and redo, the system clipboard as tab-separated text.
 4. **Files**: CSV in and out; **`.xlsx`** read and written through `sysl-lang/zip` and a
    `sysl-lang/xml` package (written for this), with the LibreOffice oracle. File dialogs (SDL3's).
+   - [x] CSV and TSV read and written (`csv.sysl`), `.xlsx` read and written (`xlsx.sysl`), by name
+     (`files.sysl`: `open_bytes`, `save_bytes`).
+   - [x] `abax-cli`: print, convert, dump.
+   - [x] The LibreOffice oracle (`oracle/`) and its generated `tests_oracle.sysl`; LibreOffice- and
+     Excel-shaped fixtures in `testdata/`.
+   - [ ] Open, Save and Save As in the application, with SDL3's file dialogs.
 5. **Formatting**: number formats (fixed, percent, currency, dates), bold/italic, alignment, fill
    colour — kept in the model and in `.xlsx`.
 6. **Several sheets**: tabs, cross-sheet references, rename, insert, delete.

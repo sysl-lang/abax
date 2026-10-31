@@ -89,6 +89,70 @@ selects it. A formula typed into the formula bar goes into the active cell on En
 function with the wrong number of arguments is refused there, with a message. Saving and opening
 files are not written yet; their menu items say so.
 
+## Files
+
+The library reads and writes **CSV** (and TSV) and **`.xlsx`** as bytes, so it still needs no
+operating system; `.xlsx` goes through [`sh.sysl.zip`](https://github.com/sysl-lang/zip) and
+[`sh.sysl.xml`](https://github.com/sysl-lang/xml).
+
+```sysl
+val got = open_bytes("budget.xlsx", read_bytes("budget.xlsx")?)?    // a Loaded: .sheet and .notes
+val bytes = save_bytes(got.sheet, "budget.csv")?                    // a Buf[u8], by extension
+```
+
+`read_csv(bytes, sep, formulas)`, `write_csv(sheet, sep)`, `read_xlsx(bytes)` and `write_xlsx(sheet)`
+are underneath, for a program that knows its format.
+
+**CSV** follows RFC 4180: quoted fields with separators, `""` and line breaks inside, CRLF, LF or CR
+line ends, a UTF-8 byte-order mark dropped, and `,`, `;` or a tab between fields. Each field is read as
+if typed, so numbers are numbers — but **a field starting with `=` is text unless formulas are asked
+for**, since a formula in a file someone sent is a way to make the sheet do what its reader did not
+ask. Writing gives the values, never the formulas, numbers as the shortest text that reads back the
+same, so a round trip keeps every digit. Lost: formulas, column widths, and the difference between
+text that looks like a number (`007`) and the number.
+
+**`.xlsx` reading** follows the package's relationships to the **first sheet** (the notes name any
+others, which are left out until abax has several sheets): numbers, shared strings including rich
+text (the runs joined, the formatting dropped, phonetic guides left out), inline strings, logicals,
+errors, and formulas **with the values the file cached for them, kept until something recalculates**.
+A shared formula is copied into each of its cells, moving its relative references; Excel's `_xlfn.`,
+`_xlws.` and `_xludf.` prefixes are dropped; `_xHHHH_` escapes are read. A formula abax cannot read
+(an array constant, a structured reference) keeps its cached value as a constant and is noted; one
+calling a function abax does not know is kept and shows `#NAME?` once recalculated. Column widths are
+read where the file set them, in pixels by Excel's rule for its default font (a width `w` is
+`floor((256w + 18) / 256 × 7)` pixels, so Excel's standard 8.43 characters is 64). Malformed input —
+a zip that is not a package, a missing part, XML that is not well formed, a cell past `XFD1048576`, a
+shared-string index out of the table — is refused with what is wrong.
+
+**`.xlsx` writing** gives the smallest package Excel and LibreOffice open without repair: content
+types, relationships, a workbook of one sheet, the sheet, shared strings and a one-style style sheet.
+Formulas are written without their `=` and with abax's value cached and typed, `_xlfn.` added where
+Excel expects it; numbers are the shortest round-trip text; widths are written back by the same rule.
+The same sheet gives the same bytes. Lost: nothing abax holds, but abax holds no formatting yet.
+
+### abax-cli
+
+```
+sysl build cli
+cli/abax-cli budget.xlsx                    every stored cell and what it shows
+cli/abax-cli budget.xlsx --cell B4 --cell C9
+cli/abax-cli convert budget.xlsx budget.csv by extension: .csv, .tsv, .xlsx
+cli/abax-cli dump budget.xlsx               address, input and exact value, tab-separated
+```
+
+`--formulas` makes a CSV or TSV field starting with `=` a formula. What a reader could not keep is
+printed on stderr as `note:` lines.
+
+### The LibreOffice oracle
+
+`zsh oracle/oracle.zsh` has abax write a workbook of every function and operator (`oracle/cases.txt`
+over the data in `oracle/data.tsv`) as `.xlsx`, LibreOffice recalculate it headless in a private
+profile and write it again, and abax read LibreOffice's file back. It compares every value and every
+formula, and writes `sh/sysl/abax/tests_oracle.sysl`, so `sysl test .` checks the agreed values without
+LibreOffice. Of 189 formulas, 169 agree with LibreOffice 26.8 and 20 are documented differences where
+abax follows Excel (logicals are not numbers to Excel, `0^0` is `#NUM!`, the first error from the left
+wins, and so on), each stated in the test. Every formula survives the round trip through LibreOffice.
+
 ## Licence
 
 ISC — see [LICENSE](LICENSE).
