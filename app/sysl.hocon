@@ -1,0 +1,25 @@
+// The abax application: a window with a menu, a name box and a formula bar, and the grid.
+//
+//     sysl run app
+//     sysl run app -- --demo
+//     sysl run app -- --demo --shot budget.png
+package {
+  name    = "abax-app"
+  version = "0.1.0"
+  sysl    = "0.8.10"
+}
+
+optimization = "2"
+
+// **`os` and `heap`** for the screenshot and the sheet; **`posix`** because SDL opens a window and
+// talks to a window server.
+requires {
+  os    = true
+  posix = true
+  heap  = true
+}
+
+dependencies {
+  abax       { workspace = true }
+  syslui-sdl { git = "github.com/sysl-lang/syslui-sdl", version = "0.2.19" }
+}

@@ -1,0 +1,502 @@
+// The window: the menu bar, the name box and the formula bar, the grid, and the line under it.
+//
+// **The grid is a view of its own that draws only what is on screen.** A sheet is 16,384 columns by
+// 1,048,576 rows, so nothing is laid out ahead: each paint walks the columns from the first one shown
+// until the cells are full, and the rows likewise, and asks the sheet for exactly those cells.
+
+import sh.sysl.abax.{Value, Area, column_name, MAX_COLS, MAX_ROWS}
+import sh.sysl.ui.{View, Canvas, Size, Rect, Press, Key, NOBODY, column, row, text, text_field,
+                   menu_bar, menu, item, separator, light}
+import sh.sysl.ui_sdl.stop
+import sysl.buf.{Buf, buf}
+
+const GROUND: u32 = 0xFFFFFF
+const INK: u32 = 0x202124
+const DIM: u32 = 0x5F6368
+const GRIDLINE: u32 = 0xE2E3E3
+const HEADER: u32 = 0xF3F4F5
+const HEADER_EDGE: u32 = 0xC9CCCF
+const HEADER_PICKED: u32 = 0xD3E3FD
+const ACTIVE: u32 = 0x1A73E8
+const PICKED: u32 = 0xE8F0FE
+const FAULT: u32 = 0xC5221F
+
+// The keyboard ids of the three things that take it.
+const GRID: int = 1
+const NAME_BOX: int = 2
+const FORMULA_BAR: int = 3
+
+// The space between a cell's edge and its text.
+const PAD: int = 4
+
+// The whole window.
+screen(m: &Model) -> &View =
+    column([
+        menus(m),
+        row([
+            keyed(text_field(m.name, NAME_BOX, 96), NAME_BOX, p -> name_key(m, p)),
+            text("fx").foreground(DIM),
+            keyed(text_field(m.bar, FORMULA_BAR, 300), FORMULA_BAR, p -> bar_key(m, p)).flex(),
+        ], 8).padding(4),
+        grid(m).flex(),
+        status_line(m),
+    ]).restyle(t -> light())
+
+keyed(child: &View, id: int, on: &Fn(Press) -> bool) -> &View = Keyed(child, id, on)
+
+grid(m: &Model) -> &View = Grid(m)
+
+private status_line(m: &Model) -> &View = Status(m)
+
+// --- The menus --------------------------------------------------------------------------------------
+
+private menus(m: &Model) -> &View =
+    menu_bar([
+        menu("File", [
+            item("New", () -> m.renew(), "Ctrl+N"),
+            item("Open…", () -> not_yet(m, "Opening"), "Ctrl+O"),
+            item("Save", () -> not_yet(m, "Saving"), "Ctrl+S"),
+            item("Save As…", () -> not_yet(m, "Saving"), "Ctrl+Shift+S"),
+            separator(),
+            item("Quit", () -> stop(), "Ctrl+Q"),
+        ]),
+        menu("Edit", [
+            item("Undo", () -> (), "Ctrl+Z", enabled = false),
+            item("Redo", () -> (), "Ctrl+Y", enabled = false),
+            separator(),
+            item("Cut", () -> (), "Ctrl+X", enabled = false),
+            item("Copy", () -> (), "Ctrl+C", enabled = false),
+            item("Paste", () -> (), "Ctrl+V", enabled = false),
+            separator(),
+            item("Clear contents", () -> m.clear(), "Del"),
+            item("Delete cells…", () -> (), enabled = false),
+            separator(),
+            item("Select all", () -> m.select_all(), "Ctrl+A"),
+        ]),
+        menu("Insert", [
+            item("Row above", () -> (), enabled = false),
+            item("Column left", () -> (), enabled = false),
+        ]),
+        menu("Format", [
+            item("Standard column width", () -> m.standard_width()),
+            separator(),
+            item("Number…", () -> (), enabled = false),
+            item("Bold", () -> (), "Ctrl+B", enabled = false),
+            item("Italic", () -> (), "Ctrl+I", enabled = false),
+        ]),
+        menu("Help", [
+            item("About abax", () -> m.say("abax 0.1.0 — a spreadsheet written in sysl, on syslUI")),
+        ]),
+    ], m.open)
+
+// A menu item whose work is not written yet says so on the line under the grid.
+not_yet(m: &Model, what: string) = m.say(s"${what} files is not written yet: abax has no file format so far", true)
+
+// --- The name box and the formula bar ---------------------------------------------------------------
+
+// A field that does something when Enter or Escape is pressed in it. `on` answers whether the grid
+// takes the keyboard back.
+private struct Keyed
+    child: &View
+    id: int
+    on: &Fn(Press) -> bool
+
+impl View for Keyed
+    measure(&self, c: *Canvas, avail: Size) -> Size = self.child.measure(c, avail)
+
+    paint(&self, c: *Canvas, r: Rect)
+        if c.focus() == self.id
+            for p in c.keys()
+                if (p.key == Key.Enter || p.key == Key.Escape) && (self.on)(p)
+                    c.take_focus(GRID)
+                    break
+
+        self.child.paint(c, r)
+
+// Enter in the name box goes to what it names; Escape puts the active cell's address back.
+name_key(m: &Model, p: Press) -> bool
+    if p.key == Key.Enter
+        val _ = m.jump_to(m.name.read())
+    else
+        m.sync()
+
+    true
+
+// Enter in the formula bar puts its text into the active cell, unless it is a formula that does not
+// read; Escape puts the cell's own text back.
+bar_key(m: &Model, p: Press) -> bool
+    if p.key == Key.Escape
+        m.cancel()
+        return true
+
+    m.commit_bar(m.bar.read())
+
+// --- The line under the grid ------------------------------------------------------------------------
+
+private struct Status
+    m: &Model
+
+impl View for Status
+    measure(&self, c: *Canvas, avail: Size) -> Size = Size(avail.w, c.text_size("").h + 8)
+
+    paint(&self, c: *Canvas, r: Rect)
+        val h = c.text_size("").h
+
+        c.fill(r, HEADER)
+        c.fill(Rect(r.x, r.y, r.w, 1), HEADER_EDGE)
+        c.ink(if self.m.alert && self.m.message.len > 0 then FAULT else DIM)
+        c.text(Rect(r.x + 8, r.y + (r.h - h) / 2, r.w - 16, h), self.m.status())
+        c.unink()
+
+// --- The grid -------------------------------------------------------------------------------------
+
+private struct Grid
+    m: &Model
+
+// One column on screen: which, where it starts, and how wide.
+struct Shown
+    col: int
+    x: int
+    w: int
+
+// Where everything lands in the grid's rectangle, for the scroll position it was worked out at.
+struct Layout
+    corner: Rect
+    heads: Rect
+    numbers: Rect
+    cells: Rect
+    cols: Buf[Shown]
+    // How many rows are drawn, the last perhaps cut off by the bottom edge.
+    rows: int
+
+    // The column under `x`, the nearest one shown if `x` is off to either side.
+    col_at(self, x: int) -> int
+        val n = self.cols.len()
+
+        if x < self.cells.x then return self.cols[0].col
+
+        for k in 0..<n
+            if x < self.cols[k].x + self.cols[k].w then return self.cols[k].col
+
+        self.cols[n - 1].col
+    end col_at
+
+    // Which of the columns shown this is, or -1.
+    shown(self, col: int) -> int
+        for k in 0..<self.cols.len()
+            if self.cols[k].col == col then return int(k)
+
+        -1
+    end shown
+
+    row_y(self, m: &Model, row: int) -> int = self.cells.y + (row - m.top) * ROW_H
+
+// The layout of the grid for the model's scroll position.
+layout(m: &Model, c: *Canvas, r: Rect) -> Layout
+    val numbers_w = c.text_size("1048576").w + 2 * PAD + 6
+    val cells = Rect(r.x + numbers_w, r.y + ROW_H, (r.w - numbers_w).max(0), (r.h - ROW_H).max(0))
+    var cols: Buf[Shown] = buf()
+    var x = cells.x
+    var col = m.left
+
+    // At least one, so that a grid with no room still has a column to point at.
+    loop
+        val w = m.width(col)
+
+        cols.push(Shown(col, x, w))
+        x += w
+        col += 1
+
+        if x >= cells.right() || col >= MAX_COLS then break
+
+    val rows = ((cells.h + ROW_H - 1) / ROW_H).min(MAX_ROWS - m.top).max(1)
+
+    Layout(Rect(r.x, r.y, numbers_w, ROW_H), Rect(cells.x, r.y, cells.w, ROW_H),
+           Rect(r.x, cells.y, numbers_w, cells.h), cells, cols, rows)
+end layout
+
+// The grab slots of the three things that can be dragged.
+const DRAG_CELLS: int = 1
+const DRAG_HEADS: int = 2
+const DRAG_NUMBERS: int = 3
+
+// How near a column's right edge a press has to land to drag it.
+const EDGE: int = 4
+
+impl View for Grid
+    measure(&self, c: *Canvas, avail: Size) -> Size = avail
+
+    paint(&self, c: *Canvas, r: Rect)
+        val m = self.m
+        val was = layout(m, c, r)
+
+        m.room_w = was.cells.w
+        m.room_h = was.cells.h
+        point(m, c, was)
+
+        val (dx, dy) = c.wheel(r)
+
+        if dx != 0 || dy != 0 then m.wheel(dx, dy)
+
+        // **The grid has the keyboard whenever nothing else wants it**, so a click on the menu bar
+        // or a key pressed before anything was clicked lands in the sheet.
+        if c.focus() == NOBODY then c.take_focus(GRID)
+
+        m.focused = c.focus() == GRID
+
+        if m.focused
+            for p in c.keys()
+                m.key(p)
+
+        m.double = false
+        draw(m, c, r, layout(m, c, r))
+    end paint
+
+// What the pointer did this frame: a press on a cell, a header or the corner, and a drag from one.
+private point(m: &Model, c: *Canvas, at: Layout)
+    val stretch = c.modifiers().shift
+
+    if c.tapped(at.cells)
+        val (tx, ty) = c.tap_point()
+        val col = at.col_at(tx)
+        val row = row_at(m, at, ty)
+
+        c.take_focus(GRID)
+        m.click(col, row, stretch)
+
+        if m.double && !stretch && !m.editing then m.edit_existing()
+    elif c.tapped(at.heads)
+        val (tx, _) = c.tap_point()
+
+        c.take_focus(GRID)
+        m.resizing = -1
+
+        for k in 0..<at.cols.len()
+            val s = at.cols[k]
+
+            if (tx - (s.x + s.w)).abs() <= EDGE
+                m.resizing = s.col
+                m.resize_x = s.x
+
+        if m.resizing < 0 then m.pick_column(at.col_at(tx), stretch)
+    elif c.tapped(at.numbers)
+        val (_, ty) = c.tap_point()
+
+        c.take_focus(GRID)
+        m.pick_row(row_at(m, at, ty), stretch)
+    elif c.tapped(at.corner)
+        c.take_focus(GRID)
+        m.select_all()
+
+    val (px, py) = c.pointer()
+
+    if c.grab(at.cells, DRAG_CELLS) && !m.editing
+        // Held past an edge, the grid scrolls a row or a column a frame toward it.
+        if py >= at.cells.bottom() then m.top = (m.top + 1).min(MAX_ROWS - 1)
+        elif py < at.cells.y && m.top > 0 then m.top -= 1
+
+        if px >= at.cells.right() then m.left = (m.left + 1).min(MAX_COLS - 1)
+        elif px < at.cells.x && m.left > 0 then m.left -= 1
+
+        m.drag(at.col_at(px), row_at(m, at, py))
+
+    if c.grab(at.heads, DRAG_HEADS)
+        if m.resizing >= 0 then m.set_width(m.resizing, px - m.resize_x)
+        else m.drag_column(at.col_at(px))
+    else
+        m.resizing = -1
+
+    if c.grab(at.numbers, DRAG_NUMBERS) then m.drag_row(row_at(m, at, py))
+end point
+
+// The row under `y`, kept to the rows on screen.
+private row_at(m: &Model, at: Layout, y: int) -> int
+    val k = if y < at.cells.y then 0 else (y - at.cells.y) / ROW_H
+
+    (m.top + k.min(at.rows - 1)).min(MAX_ROWS - 1)
+
+// --- Drawing the grid -------------------------------------------------------------------------------
+
+private draw(m: &Model, c: *Canvas, r: Rect, at: Layout)
+    val a = m.selection()
+    val th = c.text_size("").h
+    val cells = at.cells
+
+    c.fill(r, GROUND)
+    c.clip(cells)
+
+    // The selection, shaded where it is on screen.
+    val box = on_screen(m, at, a)
+
+    box match
+        Some(b) ->
+            c.fill(b, PICKED)
+
+            // The active cell is not shaded, so it reads as the one typing goes into.
+            if !a.is_cell() then
+                cell_rect(m, at, m.col, m.row) match
+                    Some(k) -> c.fill(k, GROUND)
+                    None -> ()
+        None -> ()
+
+    for k in 0..<at.cols.len()
+        val s = at.cols[k]
+
+        c.fill(Rect(s.x + s.w - 1, cells.y, 1, cells.h), GRIDLINE)
+
+    for i in 0..<at.rows
+        c.fill(Rect(cells.x, cells.y + i * ROW_H + ROW_H - 1, cells.w, 1), GRIDLINE)
+
+    for i in 0..<at.rows
+        val row = m.top + i
+
+        for k in 0..<at.cols.len()
+            draw_cell(m, c, at, int(k), row, th)
+
+    box match
+        Some(b) -> c.stroke(Rect(b.x - 1, b.y - 1, b.w + 1, b.h + 1), ACTIVE, 2)
+        None -> ()
+
+    if m.editing then draw_editor(m, c, at, th)
+
+    c.unclip()
+    draw_heads(m, c, at, a, th)
+end draw
+
+// One cell's text, clipped to the cell — or, for text with nothing to its right, to the empty cells
+// it runs on into, as every spreadsheet draws a heading wider than its column.
+private draw_cell(m: &Model, c: *Canvas, at: Layout, k: int, row: int, th: int)
+    val s = at.cols[k]
+    val v = m.sheet.value_at(s.col, row)
+    val t = v.display()
+
+    if t.len == 0 then return
+
+    val y = at.row_y(m, row)
+    val tw = c.text_size(t).w
+    var room = s.w
+
+    val (x, colour) = v match
+        Value.Number(_) -> (s.x + s.w - PAD - tw, INK)
+        Value.Bool(_) -> (s.x + (s.w - tw) / 2, INK)
+        Value.Error(_) -> (s.x + (s.w - tw) / 2, FAULT)
+        _ -> (s.x + PAD, INK)
+
+    if is_text(v)
+        var next = k + 1
+
+        while tw + 2 * PAD > room && next < int(at.cols.len()) && !m.filled(at.cols[next].col, row)
+            room += at.cols[next].w
+            next += 1
+
+    c.clip(Rect(s.x, y, room - 1, ROW_H - 1))
+    c.ink(colour)
+    c.text(Rect(x, y + (ROW_H - th) / 2, tw, th), t)
+    c.unink()
+    c.unclip()
+end draw_cell
+
+private is_text(v: Value) -> bool = v match
+    Value.Text(_) -> true
+    _ -> false
+
+// The cell being typed into: drawn over the grid, as wide as its text, with the caret.
+private draw_editor(m: &Model, c: *Canvas, at: Layout, th: int)
+    val k = at.shown(m.col)
+
+    if k < 0 || m.row < m.top || m.row >= m.top + at.rows then return
+
+    val s = at.cols[k]
+    val y = at.row_y(m, m.row)
+    val tw = c.text_size(m.text).w
+    val box = Rect(s.x, y, s.w.max(tw + 2 * PAD + 2), ROW_H - 1)
+    val ty = y + (ROW_H - th) / 2
+
+    c.fill(box, GROUND)
+
+    if !m.sel.empty()
+        val lo = c.text_x(m.text, m.sel.lo())
+        val hi = c.text_x(m.text, m.sel.hi())
+
+        c.fill(Rect(s.x + PAD + lo, ty, hi - lo, th), HEADER_PICKED)
+
+    c.ink(INK)
+    c.text(Rect(s.x + PAD, ty, tw, th), m.text)
+    c.unink()
+    c.fill(Rect(s.x + PAD + c.text_x(m.text, m.sel.head), ty, 1, th), INK)
+    c.stroke(Rect(box.x - 1, box.y - 1, box.w + 1, box.h + 2), ACTIVE, 2)
+end draw_editor
+
+// The column letters, the row numbers and the corner, the selected ones picked out.
+private draw_heads(m: &Model, c: *Canvas, at: Layout, a: Area, th: int)
+    c.fill(at.corner, HEADER)
+    c.fill(at.heads, HEADER)
+    c.fill(at.numbers, HEADER)
+    c.clip(at.heads)
+
+    for k in 0..<at.cols.len()
+        val s = at.cols[k]
+        val name = column_name(s.col)
+        val tw = c.text_size(name).w
+        val y = at.heads.y
+
+        if s.col >= a.col1 && s.col <= a.col2
+            c.fill(Rect(s.x, y, s.w, ROW_H), HEADER_PICKED)
+            c.fill(Rect(s.x, y + ROW_H - 2, s.w, 2), ACTIVE)
+
+        c.fill(Rect(s.x + s.w - 1, y, 1, ROW_H), HEADER_EDGE)
+        c.ink(DIM)
+        c.text(Rect(s.x + (s.w - tw) / 2, y + (ROW_H - th) / 2, tw, th), name)
+        c.unink()
+
+    c.unclip()
+    c.clip(at.numbers)
+
+    for i in 0..<at.rows
+        val row = m.top + i
+        val label = s"${row + 1}"
+        val tw = c.text_size(label).w
+        val y = at.row_y(m, row)
+        val x = at.numbers.x
+
+        if row >= a.row1 && row <= a.row2
+            c.fill(Rect(x, y, at.numbers.w, ROW_H), HEADER_PICKED)
+            c.fill(Rect(x + at.numbers.w - 2, y, 2, ROW_H), ACTIVE)
+
+        c.fill(Rect(x, y + ROW_H - 1, at.numbers.w, 1), HEADER_EDGE)
+        c.ink(DIM)
+        c.text(Rect(x + at.numbers.w - PAD - 4 - tw, y + (ROW_H - th) / 2, tw, th), label)
+        c.unink()
+
+    c.unclip()
+    c.fill(Rect(at.heads.x, at.heads.bottom() - 1, at.heads.w, 1), HEADER_EDGE)
+    c.fill(Rect(at.numbers.right() - 1, at.corner.y, 1, at.corner.h + at.numbers.h), HEADER_EDGE)
+end draw_heads
+
+// The rectangle a cell takes on screen, if it is on screen.
+private cell_rect(m: &Model, at: Layout, col: int, row: int) -> Option[Rect]
+    val k = at.shown(col)
+
+    if k < 0 || row < m.top || row >= m.top + at.rows then return None
+
+    val s = at.cols[k]
+
+    Some(Rect(s.x, at.row_y(m, row), s.w, ROW_H))
+
+// The part of an area that is on screen, as one rectangle, if any of it is.
+private on_screen(m: &Model, at: Layout, a: Area) -> Option[Rect]
+    val first = at.cols[0]
+    val last = at.cols[at.cols.len() - 1]
+
+    if a.col2 < first.col || a.col1 > last.col then return None
+    if a.row2 < m.top || a.row1 >= m.top + at.rows then return None
+
+    val k1 = at.shown(a.col1.max(first.col))
+    val k2 = at.shown(a.col2.min(last.col))
+    val x1 = at.cols[k1].x
+    val x2 = at.cols[k2].x + at.cols[k2].w
+    val y1 = at.row_y(m, a.row1.max(m.top))
+    val y2 = at.row_y(m, a.row2.min(m.top + at.rows - 1)) + ROW_H
+
+    Some(Rect(x1, y1, x2 - x1, y2 - y1))
+end on_screen

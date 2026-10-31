@@ -1,0 +1,496 @@
+// What the window is showing, with no window: the sheet, which cell is active and what is selected,
+// where the grid is scrolled to, how wide each column is, and the cell being typed into. Every key and
+// click the grid receives lands here as a call, so all of it is tested without SDL.
+
+import sh.sysl.abax.{Sheet, Value, Area, Ref, sheet, at, area_of, column_name, parse_ref, read_ref, general,
+                     col_of, row_of, MAX_COLS, MAX_ROWS}
+import sh.sysl.ui.{Signal, signal, Press, Key, Selection, apply}
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.text.{split, Search}
+
+// The height of a row and the width a column starts at, in points.
+const ROW_H: int = 22
+const COL_W: int = 80
+
+// The narrowest a column may be dragged to.
+const MIN_COL_W: int = 12
+
+struct Model
+    sheet: Sheet
+
+    // The active cell, and the far corner of the selection. A selection always contains the active
+    // cell; it is one cell when the two agree.
+    col: int
+    row: int
+    far_col: int
+    far_row: int
+
+    // The first column and row on screen.
+    left: int
+    top: int
+
+    // The room the cells had at the last paint, which is what "follow the active cell" and a page
+    // are measured against.
+    room_w: int
+    room_h: int
+
+    // Columns dragged away from `COL_W`.
+    widths: Map[int, int]
+
+    // The cell being typed into: its text and where the caret is. `entering` is a cell begun by
+    // typing over it, where an arrow key finishes the entry and moves; a cell opened with F2 or a
+    // double click moves its caret instead.
+    editing: bool
+    entering: bool
+    text: string
+    sel: Selection
+
+    // The line under the grid, and whether it is a complaint.
+    message: string
+    alert: bool
+
+    // The column whose right edge is being dragged, or -1, and where that column starts.
+    resizing: int
+    resize_x: int
+
+    // Whether the press the grid is about to see was the second of a double click, and whether the
+    // grid has the keyboard. Both are told by the window's events, which the grid cannot see.
+    double: bool
+    focused: bool
+
+    // What the wheel has turned that has not yet added up to a whole row or column.
+    rest_x: int
+    rest_y: int
+
+    // The name box, the formula bar, and which menu is open: the views that keep their own text.
+    name: &Signal[string]
+    bar: &Signal[string]
+    open: &Signal[int]
+
+    // --- Reading ------------------------------------------------------------------------------------
+
+    // The selected area.
+    selection(self) -> Area = area_of(at(self.col, self.row), at(self.far_col, self.far_row))
+
+    // The active cell's address, `B7`.
+    address(self) -> string = at(self.col, self.row).text()
+
+    // What the name box shows: the active cell, or the selection's size while one is being made.
+    name_text(self) -> string = self.address()
+
+    // What was typed into the active cell, and what the formula bar shows for it: the formula's
+    // canonical text for a formula.
+    input(self) -> string
+        val a = self.address()
+
+        self.sheet.formula(a) match
+            Some(f) -> f
+            None -> self.sheet.input(a)
+    end input
+
+    width(self, col: int) -> int = self.widths.get(col).unwrap_or(COL_W)
+
+    // How many whole rows the cells have room for, at least one.
+    rows_shown(self) -> int = (self.room_h / ROW_H).max(1)
+
+    // Is there anything in this cell?
+    filled(self, col: int, row: int) -> bool =
+        inside(col, row) && !is_empty_value(self.sheet.value_at(col, row))
+
+    // What the line under the grid says: a message if there is one, otherwise the count, sum and
+    // average of a selection of more than one cell.
+    status(self) -> string
+        if self.message.len > 0 then return self.message
+
+        val a = self.selection()
+
+        if a.is_cell() then return ""
+
+        val values = self.sheet.stored_in(a)
+        var count = 0
+        var numbers = 0
+        var sum = 0.0
+
+        for k in 0..<values.len()
+            values[k] match
+                Value.Empty -> ()
+                Value.Number(x) ->
+                    count += 1
+                    numbers += 1
+                    sum += x
+                _ -> count += 1
+
+        if count == 0 then return ""
+        if numbers == 0 then return s"Count: ${count}"
+
+        s"Average: ${general(sum / real(numbers))}    Count: ${count}    Sum: ${general(sum)}"
+    end status
+
+    // --- Moving -------------------------------------------------------------------------------------
+
+    // Make a cell active and the selection that one cell, and bring it on screen.
+    go(*self, col: int, row: int)
+        self.col = col.clamp(0, MAX_COLS - 1)
+        self.row = row.clamp(0, MAX_ROWS - 1)
+        self.far_col = self.col
+        self.far_row = self.row
+        self.message = ""
+        self.follow(self.col, self.row)
+        self.sync()
+
+    // Move the selection's far corner, leaving the active cell where it is, and bring it on screen
+    // along the axes asked — not down to the last row for a whole column picked.
+    extend(*self, col: int, row: int, across: bool = true, down: bool = true)
+        self.far_col = col.clamp(0, MAX_COLS - 1)
+        self.far_row = row.clamp(0, MAX_ROWS - 1)
+        self.message = ""
+        self.follow(if across then self.far_col else self.left, if down then self.far_row else self.top)
+        self.sync()
+
+    // An arrow, Tab or Enter: one step, or with shift the far corner one step.
+    step(*self, dc: int, dr: int, stretch: bool)
+        if stretch then self.extend(self.far_col + dc, self.far_row + dr)
+        else self.go(self.col + dc, self.row + dr)
+
+    // Ctrl and an arrow: to the edge of the block of filled cells, as every spreadsheet does — along
+    // a run of filled cells to its last one, or across empty ones to the next filled one or the edge.
+    leap(*self, dc: int, dr: int, stretch: bool)
+        var c = if stretch then self.far_col else self.col
+        var r = if stretch then self.far_row else self.row
+
+        if self.filled(c, r) && self.filled(c + dc, r + dr)
+            while self.filled(c + dc, r + dr)
+                c += dc
+                r += dr
+        else
+            loop
+                if !inside(c + dc, r + dr) then break
+
+                c += dc
+                r += dr
+
+                // Coming back from beyond everything stored, the walk starts at its edge.
+                if dc < 0 && c > self.sheet.last_col then c = self.sheet.last_col.max(0)
+                if dr < 0 && r > self.sheet.last_row then r = self.sheet.last_row.max(0)
+
+                if self.filled(c, r) then break
+
+                // Past everything stored, nothing more will be found: straight to the edge.
+                if (dc > 0 && c > self.sheet.last_col) || (dr > 0 && r > self.sheet.last_row)
+                    if dc > 0 then c = MAX_COLS - 1
+                    if dr > 0 then r = MAX_ROWS - 1
+                    break
+
+        if stretch then self.extend(c, r) else self.go(c, r)
+    end leap
+
+    // Page Up and Page Down: a screenful, the grid moving with the active cell.
+    page(*self, down: bool, stretch: bool)
+        val n = if down then self.rows_shown() else -self.rows_shown()
+
+        self.top = (self.top + n).clamp(0, MAX_ROWS - 1)
+
+        if stretch then self.extend(self.far_col, self.far_row + n) else self.go(self.col, self.row + n)
+
+    // Scroll so that a cell is wholly on screen.
+    follow(*self, col: int, row: int)
+        val n = self.rows_shown()
+
+        if row < self.top then self.top = row
+        elif row >= self.top + n then self.top = row - n + 1
+
+        if col < self.left
+            self.left = col
+            return
+
+        // The leftmost first column that still shows `col` whole.
+        var first = col
+        var used = self.width(col)
+
+        while first > 0 && used + self.width(first - 1) <= self.room_w
+            first -= 1
+            used += self.width(first)
+
+        if self.left < first then self.left = first
+    end follow
+
+    // The wheel or a trackpad turned, in points; positive moves the content down and right.
+    wheel(*self, dx: int, dy: int)
+        self.rest_y += dy
+        self.rest_x += dx
+
+        val rows = self.rest_y / ROW_H
+        val cols = self.rest_x / (COL_W / 2)
+
+        self.rest_y -= rows * ROW_H
+        self.rest_x -= cols * (COL_W / 2)
+        self.top = (self.top - rows).clamp(0, MAX_ROWS - 1)
+        self.left = (self.left - cols).clamp(0, MAX_COLS - 1)
+
+    // --- Picking with the pointer -------------------------------------------------------------------
+
+    // A click on a cell, with shift to stretch the selection to it.
+    click(*self, col: int, row: int, stretch: bool)
+        if self.editing && !self.commit() then return
+
+        if stretch then self.extend(col, row) else self.go(col, row)
+
+    // A drag across the cells, after the press that began it.
+    drag(*self, col: int, row: int)
+        if self.far_col != col || self.far_row != row then self.extend(col, row)
+
+    // A click on a column's letter: the whole column, its first cell active, the grid not scrolled
+    // up or down. With shift, every column from the active one to it.
+    pick_column(*self, col: int, stretch: bool)
+        if self.editing && !self.commit() then return
+
+        if !stretch then self.col = col.clamp(0, MAX_COLS - 1)
+
+        self.row = 0
+        self.extend(col, MAX_ROWS - 1, down = false)
+
+    // A drag along the column letters.
+    drag_column(*self, col: int) = if self.far_col != col then self.extend(col, MAX_ROWS - 1, down = false)
+
+    // A row's number, likewise.
+    pick_row(*self, row: int, stretch: bool)
+        if self.editing && !self.commit() then return
+
+        if !stretch then self.row = row.clamp(0, MAX_ROWS - 1)
+
+        self.col = 0
+        self.extend(MAX_COLS - 1, row, across = false)
+
+    drag_row(*self, row: int) = if self.far_row != row then self.extend(MAX_COLS - 1, row, across = false)
+
+    select_all(*self)
+        self.col = 0
+        self.row = 0
+        self.far_col = MAX_COLS - 1
+        self.far_row = MAX_ROWS - 1
+        self.sync()
+
+    // A column's right edge dragged to make it `w` wide.
+    set_width(*self, col: int, w: int) = self.widths.put(col, w.max(MIN_COL_W))
+
+    // Every selected column back to the standard width.
+    standard_width(*self)
+        val a = self.selection()
+
+        if a.width() == MAX_COLS
+            self.widths.clear()
+            return
+
+        for k in a.col1..a.col2
+            val _ = self.widths.remove(k)
+    end standard_width
+
+    // The name box: a cell or a range typed into it, selected.
+    jump_to(*self, text: string) -> bool
+        val parts = split(text.trim(), ":")
+        val first = if parts.len == 1 then parse_ref(parts[0]) else end_ref(parts[0])
+        val last = if parts.len == 2 then end_ref(parts[1]) else first
+
+        if parts.len > 2 || first.is_none() || last.is_none()
+            self.say(s"'${text}' is not a cell or a range", true)
+            self.sync()
+            return false
+
+        val a = area_of(first.unwrap(), last.unwrap())
+
+        self.go(a.col1, a.row1)
+        self.extend(a.col2, a.row2)
+        self.follow(a.col1, a.row1)
+        true
+    end jump_to
+
+    // --- Typing -------------------------------------------------------------------------------------
+
+    // A key, while the grid has the keyboard.
+    key(*self, p: Press)
+        if self.editing then self.edit_key(p) else self.move_key(p)
+
+    private move_key(*self, p: Press)
+        p.key match
+            Key.Typed(t) -> self.begin(t, true)
+            Key.Left -> if p.ctrl then self.leap(-1, 0, p.shift) else self.step(-1, 0, p.shift)
+            Key.Right -> if p.ctrl then self.leap(1, 0, p.shift) else self.step(1, 0, p.shift)
+            Key.Up -> if p.ctrl then self.leap(0, -1, p.shift) else self.step(0, -1, p.shift)
+            Key.Down -> if p.ctrl then self.leap(0, 1, p.shift) else self.step(0, 1, p.shift)
+            Key.Tab -> self.go(self.col + (if p.shift then -1 else 1), self.row)
+            Key.Enter -> self.go(self.col, self.row + (if p.shift then -1 else 1))
+            Key.Home ->
+                val row = if p.ctrl then 0 else self.row
+
+                if p.shift then self.extend(0, if p.ctrl then 0 else self.far_row) else self.go(0, row)
+            Key.End ->
+                if p.ctrl then self.go(self.sheet.last_col.max(0), self.sheet.last_row.max(0))
+            Key.Delete -> self.clear()
+            Key.Backspace -> self.clear()
+            Key.Escape ->
+                self.message = ""
+                self.sync()
+    end move_key
+
+    private edit_key(*self, p: Press)
+        p.key match
+            Key.Enter -> if self.commit() then self.go(self.col, self.row + (if p.shift then -1 else 1))
+            Key.Tab -> if self.commit() then self.go(self.col + (if p.shift then -1 else 1), self.row)
+            Key.Escape -> self.cancel()
+            Key.Left -> self.arrow(p, -1, 0)
+            Key.Right -> self.arrow(p, 1, 0)
+            Key.Up -> self.arrow(p, 0, -1)
+            Key.Down -> self.arrow(p, 0, 1)
+            _ -> self.typed(p)
+
+    // An arrow while typing: it finishes a cell typed over and moves, and moves the caret in a cell
+    // opened to be changed.
+    private arrow(*self, p: Press, dc: int, dr: int)
+        if !self.entering then self.typed(p)
+        elif self.commit() then self.go(self.col + dc, self.row + dr)
+
+    private typed(*self, p: Press)
+        val e = apply(self.text, self.sel, p)
+
+        self.text = e.text
+        self.sel = e.sel
+        self.bar.set(e.text)
+
+    // Start typing into the active cell with `text` in it, the caret at its end.
+    begin(*self, text: string, entering: bool)
+        self.editing = true
+        self.entering = entering
+        self.text = text
+        self.sel = Selection(text.len, text.len)
+        self.far_col = self.col
+        self.far_row = self.row
+        self.message = ""
+        self.follow(self.col, self.row)
+        self.bar.set(text)
+
+    // F2, or a double click: change what is in the active cell.
+    edit_existing(*self) = self.begin(self.input(), false)
+
+    // F2 while typing switches between moving the caret and finishing the entry with an arrow.
+    toggle_entering(*self) = self.entering = !self.entering
+
+    // Put what was typed into the cell. A formula that does not read is refused, the cell stays open,
+    // and the line under the grid says why.
+    commit(*self) -> bool
+        if !self.editing then return true
+
+        self.sheet.set_at(self.col, self.row, self.text) match
+            Ok(_) ->
+                self.editing = false
+                self.message = ""
+                self.alert = false
+                self.sync()
+                true
+            Err(e) ->
+                self.say(e, true)
+                false
+    end commit
+
+    cancel(*self)
+        self.editing = false
+        self.message = ""
+        self.sync()
+
+    // The formula bar's text, put into the active cell.
+    commit_bar(*self, text: string) -> bool
+        self.sheet.set_at(self.col, self.row, text) match
+            Ok(_) ->
+                self.editing = false
+                self.message = ""
+                self.sync()
+                true
+            Err(e) ->
+                self.say(e, true)
+                false
+    end commit_bar
+
+    // Empty every selected cell.
+    clear(*self)
+        val a = self.selection()
+        var doomed: Buf[long] = buf()
+
+        for (k, _) in self.sheet.cells
+            if a.contains(col_of(k), row_of(k)) then doomed.push(k)
+
+        for i in 0..<doomed.len()
+            val _ = self.sheet.set_at(col_of(doomed[i]), row_of(doomed[i]), "")
+
+        self.message = ""
+        self.sync()
+    end clear
+
+    // A fresh, empty sheet.
+    renew(*self)
+        self.sheet = sheet("Sheet1")
+        self.widths.clear()
+        self.editing = false
+        self.left = 0
+        self.top = 0
+        self.go(0, 0)
+
+    // Something for the line under the grid.
+    say(*self, text: string, alert: bool = false)
+        self.message = text
+        self.alert = alert
+
+    // Tell the name box and the formula bar what the active cell is now.
+    sync(*self)
+        self.name.set(self.name_text())
+
+        if !self.editing then self.bar.set(self.input())
+end Model
+
+// Is this a cell of the sheet at all?
+inside(col: int, row: int) -> bool = col >= 0 && col < MAX_COLS && row >= 0 && row < MAX_ROWS
+
+// One end of a range in the name box: a cell, or only a column's letters or a row's number.
+private end_ref(text: string) -> Option[Ref] =
+    read_ref(text.trim().bytes, 0) match
+        Some((r, n)) -> if n == text.trim().len then Some(r) else None
+        None -> None
+
+// A window's worth of state over an empty sheet.
+model() -> &Model
+    val m: &Model = Model(sheet("Sheet1"), 0, 0, 0, 0, 0, 0, 1000, 600, map(), false, false, "",
+                          Selection(0, 0), "", false, -1, 0, false, false, 0, 0, signal("A1"),
+                          signal(""), signal(-1))
+    m
+end model
+
+// The example `--demo` opens: a quarter's household budget, totalled.
+demo(m: &Model)
+    val rows = [
+        ["Household budget", "", "", "", ""],
+        ["", "", "", "", ""],
+        ["Item", "January", "February", "March", "Quarter"],
+        ["Rent", "1200", "1200", "1200", "=SUM(B4:D4)"],
+        ["Groceries", "412.5", "389.2", "430.75", "=SUM(B5:D5)"],
+        ["Utilities", "145", "162.3", "138.9", "=SUM(B6:D6)"],
+        ["Transport", "96", "104.5", "88", "=SUM(B7:D7)"],
+        ["Going out", "120", "75", "160", "=SUM(B8:D8)"],
+        ["Total", "=SUM(B4:B8)", "=SUM(C4:C8)", "=SUM(D4:D8)", "=SUM(E4:E8)"],
+        ["", "", "", "", ""],
+        ["Monthly average", "=E9/3", "", "", ""],
+        ["Largest item", "=MAX(E4:E8)", "", "", ""],
+        ["Rent share", "=ROUND(E4/E9*100,1)&\"%\"", "", "", ""],
+        ["Verdict", "=IF(E9>5000,\"over budget\",\"within budget\")", "", "", ""],
+    ]
+
+    for r in 0..<rows.len
+        for c in 0..<rows[r].len
+            if rows[r][c].len > 0 then m.sheet.set_at(int(c), int(r), rows[r][c]).unwrap()
+
+    m.set_width(0, 130)
+    m.go(4, 8)
+end demo
+
+// A `Value` that is empty.
+private is_empty_value(v: Value) -> bool = v match
+    Value.Empty -> true
+    _ -> false

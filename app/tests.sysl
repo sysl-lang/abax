@@ -1,0 +1,648 @@
+@tests
+
+import sh.sysl.abax.{Value, Area, MAX_COLS, MAX_ROWS}
+import sh.sysl.ui.{View, Recorder, Rect, Key, Press, recorder, render, press, typed, text_field}
+import sysl.text.Search
+
+// The grid alone, drawn through a recorder whose font is eight points a character and sixteen a
+// line: the row numbers take 70 points, the column letters 22, so column A runs from x 70 to 150,
+// B to 230, and row 1 from y 22 to 44.
+val AREA = Rect(0, 0, 800, 400)
+
+private frame(m: &Model, c: *Recorder)
+    c.ops.clear()
+    render(grid(m), c, AREA)
+
+// A press and a release at one point, each a frame.
+private click_at(m: &Model, c: *Recorder, x: int, y: int)
+    c.point(x, y, true)
+    frame(m, c)
+    c.point(x, y, false)
+    frame(m, c)
+
+private keys(m: &Model, c: *Recorder, ps: []Press)
+    for p in ps
+        c.key(p)
+
+    frame(m, c)
+
+private shift(k: Key) -> Press = Press(k, true, false)
+private ctrl(k: Key) -> Press = Press(k, false, true)
+
+// The middle of a cell on the recorder's grid, while it is scrolled to the top left.
+private cx(col: int) -> int = 70 + col * 80 + 40
+private cy(row: int) -> int = 22 + row * 22 + 11
+
+private has(c: *Recorder, line: string) -> bool
+    for k in 0..<c.ops.len()
+        if c.ops[k] == line then return true
+
+    false
+
+private count_with(c: *Recorder, part: string) -> int
+    var n = 0
+
+    for k in 0..<c.ops.len()
+        if c.ops[k].starts_with("text ") && c.ops[k].contains(part) then n += 1
+
+    n
+
+private placed(m: &Model, col: int, row: int, far_col: int, far_row: int) -> bool =
+    m.col == col && m.row == row && m.far_col == far_col && m.far_row == far_row
+
+// --- Moving with the keyboard ---------------------------------------------------------------------
+
+@test("arrows, Tab and Enter move one cell, and stop at the sheet's edges")
+moving()
+    val m = model()
+
+    m.key(press(Key.Right))
+    m.key(press(Key.Down))
+    m.key(press(Key.Down))
+    assert(placed(m, 1, 2, 1, 2))
+    assert_eq(m.address(), "B3")
+    assert_eq(m.name.read(), "B3")
+
+    m.key(press(Key.Tab))
+    assert_eq(m.address(), "C3")
+    m.key(shift(Key.Tab))
+    m.key(shift(Key.Tab))
+    assert_eq(m.address(), "A3")
+    m.key(press(Key.Enter))
+    assert_eq(m.address(), "A4")
+    m.key(shift(Key.Enter))
+    assert_eq(m.address(), "A3")
+
+    m.key(press(Key.Left))
+    assert_eq(m.address(), "A3")
+    m.key(ctrl(Key.Home))
+    m.key(press(Key.Up))
+    assert_eq(m.address(), "A1")
+
+    m.go(MAX_COLS - 1, MAX_ROWS - 1)
+    m.key(press(Key.Right))
+    m.key(press(Key.Down))
+    assert_eq(m.address(), "XFD1048576")
+
+@test("Home goes to the row's first column, Ctrl+Home to A1, Ctrl+End to the last cell used")
+home_and_end()
+    val m = model()
+
+    m.sheet.set("D9", "1").unwrap()
+    m.sheet.set("B12", "2").unwrap()
+    m.go(5, 6)
+    m.key(press(Key.Home))
+    assert_eq(m.address(), "A7")
+    m.key(ctrl(Key.End))
+    assert_eq(m.address(), "D12")
+    m.key(ctrl(Key.Home))
+    assert_eq(m.address(), "A1")
+
+@test("shift and an arrow stretch the selection; a plain arrow brings it back to one cell")
+stretching()
+    val m = model()
+
+    m.go(1, 1)
+    m.key(shift(Key.Right))
+    m.key(shift(Key.Down))
+    m.key(shift(Key.Down))
+    assert(placed(m, 1, 1, 2, 3))
+    assert(m.selection() == Area(1, 1, 2, 3))
+
+    // Back past the active cell, the selection turns over it.
+    m.key(shift(Key.Left))
+    m.key(shift(Key.Left))
+    assert(m.selection() == Area(0, 1, 1, 3))
+
+    m.key(press(Key.Down))
+    assert(placed(m, 1, 2, 1, 2))
+    assert(m.selection() == Area(1, 2, 1, 2))
+
+@test("Ctrl and an arrow go to the edge of the filled block, or across the gap to the next one")
+leaping()
+    val m = model()
+
+    for r in 0..<5
+        m.sheet.set_at(0, r, "1").unwrap()
+
+    m.sheet.set_at(0, 9, "x").unwrap()
+
+    m.key(ctrl(Key.Down))
+    assert_eq(m.address(), "A5")
+    m.key(ctrl(Key.Down))
+    assert_eq(m.address(), "A10")
+    m.key(ctrl(Key.Down))
+    assert_eq(m.address(), "A1048576")
+    m.key(ctrl(Key.Up))
+    assert_eq(m.address(), "A10")
+    m.key(ctrl(Key.Right))
+    assert_eq(m.address(), "XFD10")
+    m.key(ctrl(Key.Left))
+    assert_eq(m.address(), "A10")
+
+    // With shift, the far corner leaps and the active cell stays.
+    m.go(0, 0)
+    m.key(Press(Key.Down, true, true))
+    assert(placed(m, 0, 0, 0, 4))
+
+@test("following the active cell scrolls just far enough, both ways")
+following()
+    val m = model()
+
+    m.room_w = 400
+    m.room_h = 220
+    assert_eq(m.rows_shown(), 10)
+
+    m.go(0, 15)
+    assert_eq(m.top, 6)
+    m.go(0, 3)
+    assert_eq(m.top, 3)
+
+    // Five columns of 80 fit in 400: the eighth column shown whole puts the fourth first.
+    m.go(7, 3)
+    assert_eq(m.left, 3)
+    m.go(1, 3)
+    assert_eq(m.left, 1)
+
+    // A column wider than the room is still made the first one.
+    m.set_width(30, 900)
+    m.go(30, 3)
+    assert_eq(m.left, 30)
+
+@test("Page Down and Page Up move the cell and the grid a screenful")
+paging()
+    val m = model()
+
+    m.room_h = 220
+    m.go(2, 4)
+    m.page(true, false)
+    assert_eq(m.address(), "C15")
+    assert_eq(m.top, 10)
+    m.page(false, false)
+    assert_eq(m.address(), "C5")
+    assert_eq(m.top, 0)
+    m.page(false, false)
+    assert_eq(m.address(), "C1")
+
+    m.page(true, true)
+    assert(placed(m, 2, 0, 2, 10))
+
+@test("the wheel scrolls by whole rows and keeps what is left over")
+wheeling()
+    val m = model()
+
+    m.wheel(0, -30)
+    assert_eq(m.top, 1)
+    m.wheel(0, -14)
+    assert_eq(m.top, 2)
+    m.wheel(0, 500)
+    assert_eq(m.top, 0)
+    m.wheel(-90, 0)
+    assert_eq(m.left, 2)
+
+// --- Typing into a cell -----------------------------------------------------------------------------
+
+@test("typing starts a cell over, Enter puts it in and moves down")
+typing_a_number()
+    val m = model()
+
+    m.sheet.set("A1", "old").unwrap()
+    m.key(typed("4"))
+    m.key(typed("2"))
+    assert(m.editing && m.entering)
+    assert_eq(m.text, "42")
+    assert_eq(m.bar.read(), "42")
+    assert(m.sheet.value("A1") == Value.Text("old"))
+
+    m.key(press(Key.Enter))
+    assert(!m.editing)
+    assert(m.sheet.value("A1") == Value.Number(42.0))
+    assert_eq(m.address(), "A2")
+
+    m.key(typed("=A1*2"))
+    m.key(press(Key.Tab))
+    assert(m.sheet.value("A2") == Value.Number(84.0))
+    assert_eq(m.address(), "B2")
+
+    m.key(typed("x"))
+    m.key(shift(Key.Enter))
+    assert_eq(m.address(), "B1")
+    assert_eq(m.sheet.display("B2"), "x")
+
+@test("an arrow finishes a cell typed over, and moves the caret in one opened with F2")
+arrows_while_typing()
+    val m = model()
+
+    m.key(typed("ab"))
+    m.key(press(Key.Right))
+    assert(!m.editing)
+    assert_eq(m.sheet.display("A1"), "ab")
+    assert_eq(m.address(), "B1")
+
+    m.go(0, 0)
+    m.edit_existing()
+    assert(m.editing && !m.entering)
+    assert_eq(m.text, "ab")
+    m.key(press(Key.Left))
+    m.key(typed("X"))
+    m.key(press(Key.Enter))
+    assert_eq(m.sheet.display("A1"), "aXb")
+
+    // F2 a second time turns the arrows back into moving.
+    m.go(0, 0)
+    m.edit_existing()
+    m.toggle_entering()
+    m.key(press(Key.Down))
+    assert(!m.editing)
+    assert_eq(m.address(), "A2")
+
+@test("a formula's canonical text is what the formula bar and F2 show")
+canonical_formula()
+    val m = model()
+
+    m.key(typed("=sum(b1:b3)+1"))
+    m.key(press(Key.Enter))
+    m.key(press(Key.Up))
+    assert_eq(m.bar.read(), "=SUM(B1:B3)+1")
+    m.edit_existing()
+    assert_eq(m.text, "=SUM(B1:B3)+1")
+
+@test("a formula that does not read is refused: the cell stays open and the line says why")
+refused_formula()
+    val m = model()
+
+    m.sheet.set("A1", "5").unwrap()
+    m.key(typed("=1+"))
+    m.key(press(Key.Enter))
+    assert(m.editing)
+    assert(m.alert && m.message.len > 0)
+    assert_eq(m.status(), m.message)
+    assert_eq(m.address(), "A1")
+    assert(m.sheet.value("A1") == Value.Number(5.0))
+
+    m.key(typed("2"))
+    m.key(press(Key.Enter))
+    assert(!m.editing)
+    assert(m.sheet.value("A1") == Value.Number(3.0))
+    assert_eq(m.message, "")
+
+@test("Escape throws the typing away and leaves the cell as it was")
+escaping()
+    val m = model()
+
+    m.sheet.set("A1", "keep").unwrap()
+    m.key(typed("gone"))
+    m.key(press(Key.Escape))
+    assert(!m.editing)
+    assert_eq(m.sheet.display("A1"), "keep")
+    assert_eq(m.bar.read(), "keep")
+
+@test("Delete and Backspace empty every selected cell and nothing else")
+clearing()
+    val m = model()
+
+    for r in 0..<4
+        for k in 0..<4
+            m.sheet.set_at(k, r, "1").unwrap()
+
+    m.sheet.set("A2", "=SUM(B2:D2)").unwrap()
+    m.go(1, 1)
+    m.extend(2, 2)
+    m.key(press(Key.Delete))
+    assert_eq(m.sheet.count(), 12)
+    assert(m.sheet.value("B2") == Value.Empty)
+    assert(m.sheet.value("A2") == Value.Number(1.0))
+    assert(m.sheet.value("D3") == Value.Number(1.0))
+
+    m.pick_column(3, false)
+    m.key(press(Key.Backspace))
+    assert_eq(m.sheet.count(), 8)
+    assert(m.sheet.value("A2") == Value.Number(0.0))
+
+@test("the formula bar puts its text into the active cell, or refuses it and says why")
+formula_bar()
+    val m = model()
+
+    m.go(1, 1)
+    assert(m.commit_bar("=2*3"))
+    assert(m.sheet.value("B2") == Value.Number(6.0))
+    assert(!m.commit_bar("=SUM("))
+    assert(m.alert)
+    assert(m.sheet.value("B2") == Value.Number(6.0))
+
+// --- The name box -----------------------------------------------------------------------------------
+
+@test("the name box goes to a cell, a range, whole columns and rows, and refuses anything else")
+name_box()
+    val m = model()
+
+    assert(m.jump_to("c10"))
+    assert(placed(m, 2, 9, 2, 9))
+    assert_eq(m.name.read(), "C10")
+
+    assert(m.jump_to("B2:D4"))
+    assert(m.selection() == Area(1, 1, 3, 3))
+    assert_eq(m.address(), "B2")
+
+    assert(m.jump_to("D4:B2"))
+    assert(m.selection() == Area(1, 1, 3, 3))
+
+    assert(m.jump_to("E:F"))
+    assert(m.selection() == Area(4, 0, 5, MAX_ROWS - 1))
+    assert(m.jump_to("3:5"))
+    assert(m.selection() == Area(0, 2, MAX_COLS - 1, 4))
+
+    assert(!m.jump_to("Q"))
+    assert(!m.jump_to("A1:B2:C3"))
+    assert(!m.jump_to("XFE1"))
+    assert(m.alert)
+    assert(m.selection() == Area(0, 2, MAX_COLS - 1, 4))
+
+// --- The line under the grid ------------------------------------------------------------------------
+
+@test("a selection of several cells shows its average, count and sum; one cell shows nothing")
+statistics()
+    val m = model()
+
+    m.sheet.set("A1", "2").unwrap()
+    m.sheet.set("A2", "4").unwrap()
+    m.sheet.set("A3", "words").unwrap()
+    assert_eq(m.status(), "")
+    m.extend(0, 4)
+    assert_eq(m.status(), "Average: 3    Count: 3    Sum: 6")
+
+    m.go(5, 5)
+    m.extend(6, 6)
+    assert_eq(m.status(), "")
+    m.sheet.set("F6", "hi").unwrap()
+    assert_eq(m.status(), "Count: 1")
+
+    m.say("something", false)
+    assert_eq(m.status(), "something")
+
+@test("New empties the sheet and puts the grid back at A1")
+renewing()
+    val m = model()
+
+    demo(m)
+    m.set_width(3, 200)
+    m.top = 40
+    m.renew()
+    assert_eq(m.sheet.count(), 0)
+    assert_eq(m.width(3), COL_W)
+    assert_eq(m.address(), "A1")
+    assert_eq(m.top, 0)
+
+@test("the demo is a budget whose totals add up")
+the_demo()
+    val m = model()
+
+    demo(m)
+    assert_eq(m.sheet.display("E9"), "5922.15")
+    assert_eq(m.sheet.display("B14"), "over budget")
+    assert_eq(m.address(), "E9")
+    assert_eq(m.bar.read(), "=SUM(E4:E8)")
+
+// --- The grid, drawn and clicked ------------------------------------------------------------------
+
+@test("numbers are drawn right-aligned, text left, logicals and errors centred, each in its cell")
+alignment()
+    val m = model()
+    var c = recorder()
+
+    m.sheet.set("A1", "ab").unwrap()
+    m.sheet.set("B2", "5").unwrap()
+    m.sheet.set("C1", "=1/0").unwrap()
+    m.sheet.set("D1", "TRUE").unwrap()
+    frame(m, &c)
+    assert(has(&c, "text 74,25 16x16 'ab'"))
+    assert(has(&c, "text 218,47 8x16 '5'"))
+    assert(has(&c, "text 242,25 56x16 '#DIV/0!'"))
+    assert(has(&c, "text 334,25 32x16 'TRUE'"))
+    assert(has(&c, "text 106,3 8x16 'A'"))
+    assert(has(&c, "text 54,25 8x16 '1'"))
+
+@test("text runs on into empty cells to its right and stops at a filled one")
+overflow()
+    val m = model()
+    var c = recorder()
+
+    m.sheet.set("A1", "a heading far wider than one column").unwrap()
+    m.sheet.set("A2", "another one that is wide too").unwrap()
+    m.sheet.set("C2", "x").unwrap()
+    frame(m, &c)
+
+    // Column A is 80 wide; the first runs on across B, C and D, the second only across B.
+    assert(has(&c, "clip 70,22 319x21"))
+    assert(has(&c, "clip 70,44 159x21"))
+
+@test("far down and far right, the grid draws only the cells on screen, and none past XFD1048576")
+draws_only_what_is_shown()
+    val m = model()
+    var c = recorder()
+
+    m.top = MAX_ROWS - 40
+    m.left = MAX_COLS - 6
+
+    for r in MAX_ROWS - 40..<MAX_ROWS
+        for k in MAX_COLS - 6..<MAX_COLS
+            m.sheet.set_at(k, r, "v").unwrap()
+
+    frame(m, &c)
+
+    val at = layout(m, &c, AREA)
+
+    // 378 points of cells at 22 a row is 18 rows, the last cut off; six columns are left.
+    assert_eq(at.rows, 18)
+    assert_eq(at.cols.len(), 6)
+    assert_eq(count_with(&c, "'v'"), 18 * 6)
+    assert_eq(count_with(&c, "'XFD'"), 1)
+    assert_eq(count_with(&c, "'XFE'"), 0)
+    assert_eq(count_with(&c, "'1048537'"), 1)
+    assert_eq(count_with(&c, "'1048536'"), 0)
+
+    // At the very bottom, the rows stop at the last one.
+    m.top = MAX_ROWS - 3
+    frame(m, &c)
+    assert_eq(count_with(&c, "'v'"), 3 * 6)
+    assert_eq(count_with(&c, "'1048576'"), 1)
+    assert_eq(count_with(&c, "'1048577'"), 0)
+
+@test("a click selects a cell, shift and a click stretch to another, and a drag sweeps a range")
+clicking_cells()
+    val m = model()
+    var c = recorder()
+
+    frame(m, &c)
+    click_at(m, &c, cx(1), cy(2))
+    assert(placed(m, 1, 2, 1, 2))
+    assert(m.focused)
+
+    c.chord.keys = c.chord.keys with { shift = true }
+    click_at(m, &c, cx(3), cy(5))
+    assert(placed(m, 1, 2, 3, 5))
+    c.chord.keys = c.chord.keys with { shift = false }
+
+    c.point(cx(0), cy(0), true)
+    frame(m, &c)
+    c.point(cx(2), cy(1), true)
+    frame(m, &c)
+    c.point(cx(4), cy(3), true)
+    frame(m, &c)
+    c.point(cx(4), cy(3), false)
+    frame(m, &c)
+    assert(placed(m, 0, 0, 4, 3))
+
+@test("a double click opens the cell with what was typed into it")
+double_click()
+    val m = model()
+    var c = recorder()
+
+    m.sheet.set("B2", "=1+1").unwrap()
+    frame(m, &c)
+    m.double = true
+    click_at(m, &c, cx(1), cy(1))
+    assert(m.editing && !m.entering)
+    assert_eq(m.text, "=1+1")
+    assert(!m.double)
+
+@test("a click on a column letter, a row number or the corner selects the whole of it")
+clicking_headers()
+    val m = model()
+    var c = recorder()
+
+    frame(m, &c)
+    click_at(m, &c, cx(2), 10)
+    assert(m.selection() == Area(2, 0, 2, MAX_ROWS - 1))
+    assert_eq(m.address(), "C1")
+
+    c.point(cx(2), 10, true)
+    frame(m, &c)
+    c.point(cx(4), 10, true)
+    frame(m, &c)
+    c.point(cx(4), 10, false)
+    frame(m, &c)
+    assert(m.selection() == Area(2, 0, 4, MAX_ROWS - 1))
+
+    click_at(m, &c, 20, cy(3))
+    assert(m.selection() == Area(0, 3, MAX_COLS - 1, 3))
+    assert_eq(m.address(), "A4")
+
+    click_at(m, &c, 20, 10)
+    assert(m.selection() == Area(0, 0, MAX_COLS - 1, MAX_ROWS - 1))
+
+@test("a column's right edge dragged in the header makes it wider, and never narrower than a sliver")
+column_widths()
+    val m = model()
+    var c = recorder()
+
+    frame(m, &c)
+    c.point(150, 10, true)
+    frame(m, &c)
+    c.point(260, 10, true)
+    frame(m, &c)
+    c.point(260, 10, false)
+    frame(m, &c)
+    assert_eq(m.width(0), 190)
+    assert_eq(m.address(), "A1")
+    assert(m.selection().is_cell())
+
+    // Column B now starts at 260.
+    c.point(340, 10, true)
+    frame(m, &c)
+    c.point(200, 10, true)
+    frame(m, &c)
+    c.point(200, 10, false)
+    frame(m, &c)
+    assert_eq(m.width(1), MIN_COL_W)
+
+    m.select_all()
+    m.standard_width()
+    assert_eq(m.width(0), COL_W)
+
+@test("keys reach the grid when nothing else has the keyboard, and typing shows in the cell")
+typing_in_the_grid()
+    val m = model()
+    var c = recorder()
+
+    keys(m, &c, [typed("12")])
+    assert(m.editing)
+    assert(has(&c, "text 74,25 16x16 '12'"))
+
+    keys(m, &c, [press(Key.Enter), press(Key.Down)])
+    assert(m.sheet.value("A1") == Value.Number(12.0))
+    assert_eq(m.address(), "A3")
+    assert(has(&c, "text 130,25 16x16 '12'"))
+
+@test("the wheel over the grid scrolls it")
+wheel_over_the_grid()
+    val m = model()
+    var c = recorder()
+
+    c.point(cx(1), cy(1))
+    c.spin(0.0, -66.0)
+    frame(m, &c)
+    assert_eq(m.top, 3)
+    assert_eq(count_with(&c, "'4'"), 1)
+
+// --- The name box and the formula bar, typed into -------------------------------------------------
+
+val FIELD = Rect(0, 0, 300, 28)
+
+private focus_field(v: &View, c: *Recorder)
+    c.point(10, 10, true)
+    render(v, c, FIELD)
+    c.point(10, 10, false)
+    render(v, c, FIELD)
+
+private send(v: &View, c: *Recorder, p: Press)
+    c.key(p)
+    render(v, c, FIELD)
+
+@test("Enter in the formula bar puts its text into the cell and gives the grid the keyboard back")
+formula_bar_keys()
+    val m = model()
+    var c = recorder()
+    val v = keyed(text_field(m.bar, FORMULA_BAR, 300), FORMULA_BAR, p -> bar_key(m, p))
+
+    focus_field(v, &c)
+    assert_eq(c.focus(), FORMULA_BAR)
+    send(v, &c, typed("=6*7"))
+    assert_eq(m.bar.read(), "=6*7")
+    send(v, &c, press(Key.Enter))
+    assert(m.sheet.value("A1") == Value.Number(42.0))
+    assert_eq(c.focus(), GRID)
+    assert_eq(m.bar.read(), "=6*7")
+
+    // A formula that does not read keeps the keyboard in the bar; Escape puts the cell's text back.
+    focus_field(v, &c)
+    send(v, &c, press(Key.End))
+    send(v, &c, typed("+"))
+    assert_eq(m.bar.read(), "=6*7+")
+    send(v, &c, press(Key.Enter))
+    assert_eq(c.focus(), FORMULA_BAR)
+    assert(m.alert)
+    send(v, &c, press(Key.Escape))
+    assert_eq(c.focus(), GRID)
+    assert_eq(m.bar.read(), "=6*7")
+    assert(m.sheet.value("A1") == Value.Number(42.0))
+
+@test("Enter in the name box goes to what it names; a name that is no cell leaves the selection be")
+name_box_keys()
+    val m = model()
+    var c = recorder()
+    val v = keyed(text_field(m.name, NAME_BOX, 96), NAME_BOX, p -> name_key(m, p))
+
+    focus_field(v, &c)
+    m.name.set("C3:D5")
+    send(v, &c, press(Key.Enter))
+    assert(m.selection() == Area(2, 2, 3, 4))
+    assert_eq(m.name.read(), "C3")
+    assert_eq(c.focus(), GRID)
+
+    focus_field(v, &c)
+    m.name.set("nowhere")
+    send(v, &c, press(Key.Enter))
+    assert(m.alert)
+    assert(m.selection() == Area(2, 2, 3, 4))
+    assert_eq(m.name.read(), "C3")

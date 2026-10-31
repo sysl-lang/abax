@@ -1,0 +1,112 @@
+// abax, the application: a sheet in a window, with a menu, a name box, a formula bar and the grid.
+//
+//     abax-app [--demo] [--cell <address>=<input>]... [--select <range>]
+//     abax-app [--demo] [--cell <address>=<input>]... [--select <range>] --shot <out.png>
+//
+// `--demo` opens a small budget to look at. `--cell` puts something into a cell, as typing it would,
+// and `--select` selects a cell or a range, so `--shot` — which draws one frame with no window and
+// writes it to a PNG — draws a picture a machine can check.
+
+import sh.sysl.ui.{Rect, render, pluto_canvas, fraction}
+import sh.sysl.ui_sdl.{app, run, system_font, stop}
+import sh.sysl.sdl3.{Event, EventKind, KMOD_GUI, KMOD_CTRL, KMOD_SHIFT, SCANCODE_N, SCANCODE_O, SCANCODE_S,
+                     SCANCODE_Q, SCANCODE_A, SCANCODE_PAGEUP, SCANCODE_PAGEDOWN, SCANCODE_F2}
+import sh.sysl.plutovg
+import sysl.text.Search
+
+const WIDTH: int = 1100
+const HEIGHT: int = 720
+
+const USAGE: string = "usage: abax-app [--demo] [--cell <address>=<input>]... [--select <range>] [--shot <out.png>]"
+
+main(args: []string) -> Result[unit, string]
+    val m = model()
+    var shot = ""
+    var picked = ""
+    var i: usize = 1
+
+    while i < args.len
+        val a = args[i]
+
+        if a == "--shot" && i + 1 < args.len
+            shot = args[i + 1]
+            i += 2
+        elif a == "--demo"
+            demo(m)
+            i += 1
+        elif a == "--cell" && i + 1 < args.len
+            val spec = args[i + 1]
+            val eq = spec.index_of("=").ok_or(s"--cell takes <address>=<input>, not '${spec}'")?
+
+            m.sheet.set(spec[0..<eq], spec[eq + 1..<spec.len]).map_err(e -> s"--cell ${spec}: ${e}")?
+            i += 2
+        elif a == "--select" && i + 1 < args.len
+            picked = args[i + 1]
+            i += 2
+        else
+            return Err(s"${USAGE} ('${a}' is not one of these)")
+
+    if picked.len > 0 && !m.jump_to(picked) then return Err(m.message)
+
+    m.sync()
+
+    if shot == "" then return run(app("abax", () -> screen(m), () -> GROUND, WIDTH, HEIGHT,
+                                      on_event = e -> shortcut(m, e)))
+
+    val font = system_font()
+
+    if font == "" then return Err("no font this program knows about is on this machine")
+
+    val surf = plutovg.surface(WIDTH, HEIGHT).expect("a drawing surface")
+    val vg = plutovg.canvas(surf).expect("a drawing canvas")
+    val face = plutovg.font(font).expect(s"the font at ${font} opened")
+    var c = pluto_canvas(vg, face, 15.0)
+
+    surf.clear(fraction(GROUND, 16), fraction(GROUND, 8), fraction(GROUND, 0))
+    render(screen(m), &c, Rect(0, 0, WIDTH, HEIGHT))
+
+    if !surf.write_png(shot) then return Err(s"${shot} could not be written")
+
+    print(s"wrote ${shot}: ${m.address()} ${m.status()}")
+    Ok(())
+end main
+
+// The keys the grid cannot hear from the toolkit — the menu shortcuts, Page Up and Page Down, F2 —
+// and the double click, which the toolkit reports as a single tap.
+private shortcut(m: &Model, e: Event) -> bool
+    val kind = e.kind()
+
+    if kind == EventKind.MouseButtonDown
+        m.double = e.mouse_clicks() >= 2u8
+        return false
+
+    if kind != EventKind.KeyDown then return false
+
+    val key = e.key_scancode()
+    val mods = e.key_mod()
+    val command = (mods & (KMOD_GUI | KMOD_CTRL)) != 0u16
+    val shift = (mods & KMOD_SHIFT) != 0u16
+
+    if command
+        if key == SCANCODE_N then m.renew()
+        elif key == SCANCODE_O then not_yet(m, "Opening")
+        elif key == SCANCODE_S then not_yet(m, "Saving")
+        elif key == SCANCODE_Q then stop()
+        elif key == SCANCODE_A && m.focused && !m.editing then m.select_all()
+        else return false
+
+        return true
+
+    if !m.focused then return false
+
+    if key == SCANCODE_F2
+        if m.editing then m.toggle_entering() else m.edit_existing()
+    elif key == SCANCODE_PAGEUP || key == SCANCODE_PAGEDOWN
+        if m.editing && !m.commit() then return true
+
+        m.page(key == SCANCODE_PAGEDOWN, shift)
+    else
+        return false
+
+    true
+end shortcut
