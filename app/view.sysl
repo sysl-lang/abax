@@ -5,7 +5,7 @@
 // until the cells are full, and the rows likewise, and asks the sheet for exactly those cells.
 
 import sh.sysl.abax.{Value, Area, column_name, MAX_COLS, MAX_ROWS}
-import sh.sysl.ui.{View, Canvas, Size, Rect, Press, Key, NOBODY, column, row, text, text_field,
+import sh.sysl.ui.{View, Canvas, Size, Rect, Press, Key, NOBODY, column, row, text, text_field, button, spacer,
                    menu_bar, menu, item, separator, light}
 import sh.sysl.ui_sdl.stop
 import sysl.buf.{Buf, buf}
@@ -20,6 +20,13 @@ const HEADER_PICKED: u32 = 0xD3E3FD
 const ACTIVE: u32 = 0x1A73E8
 const PICKED: u32 = 0xE8F0FE
 const FAULT: u32 = 0xC5221F
+
+// The colours the references in a formula being typed are drawn in, each with the cells it names
+// outlined to match, taken in turn.
+val REF_COLOURS: [6]u32 = [0x1A73E8, 0xD93025, 0x8E24AA, 0x188038, 0xE37400, 0x00838F]
+
+// What Help → About says the version is.
+const VERSION: string = "0.1.0"
 
 // The keyboard ids of the three things that take it.
 const GRID: int = 1
@@ -40,7 +47,7 @@ screen(m: &Model) -> &View =
         ], 8).padding(4),
         grid(m).flex(),
         status_line(m),
-    ]).restyle(t -> light())
+    ]).modal(m.about, about_box(m), Some(() -> m.close_about())).restyle(t -> light())
 
 keyed(child: &View, id: int, on: &Fn(Press) -> bool) -> &View = Keyed(child, id, on)
 
@@ -89,9 +96,20 @@ private menus(m: &Model) -> &View =
             item("Italic", () -> (), "Ctrl+I", enabled = false),
         ]),
         menu("Help", [
-            item("About abax", () -> m.say("abax 0.1.0 — a spreadsheet written in sysl, on syslUI")),
+            item("About abax", () -> m.show_about()),
         ]),
     ], m.open)
+
+// --- The About dialog -------------------------------------------------------------------------------
+
+// What Help → About shows, over the whole window: Enter, Escape, OK or a click outside it closes it.
+private about_box(m: &Model) -> &View =
+    column([
+        text("abax").font_size(24.0),
+        text(s"Version ${VERSION}").foreground(DIM),
+        text("A spreadsheet written in sysl, on syslUI."),
+        row([spacer(), button("OK", () -> m.close_about())]),
+    ], 12).padding(24).panel()
 
 // A menu item whose work is not written yet says so on the line under the grid.
 not_yet(m: &Model, what: string) = m.say(s"${what} files is not written yet: abax has no file format so far", true)
@@ -236,7 +254,19 @@ impl View for Grid
 
         m.room_w = was.cells.w
         m.room_h = was.cells.h
+
+        // **Typing in the formula bar is an edit of the active cell**, so that pointing at cells
+        // writes into the bar as it would into the cell; what pointing wrote goes back to the bar's
+        // caret. A press takes the keyboard from everyone for its frame, so whose edit it is outlives
+        // that frame in the model.
+        val f = c.focus()
+
+        if f == FORMULA_BAR then m.from_bar(m.bar.read(), c.editing())
+        elif f != NOBODY then m.bar_edit = false
+
         point(m, c, was)
+
+        if m.bar_edit && c.focus() == FORMULA_BAR && m.editing && c.editing() != m.sel then c.edit(m.sel)
 
         val (dx, dy) = c.wheel(r)
 
@@ -257,22 +287,27 @@ impl View for Grid
     end paint
 
 // What the pointer did this frame: a press on a cell, a header or the corner, and a drag from one.
+//
+// A press that points a reference into the formula bar leaves the keyboard with the bar.
 private point(m: &Model, c: *Canvas, at: Layout)
     val stretch = c.modifiers().shift
+    val to = if m.bar_edit && m.can_point() then FORMULA_BAR else GRID
 
     if c.tapped(at.cells)
         val (tx, ty) = c.tap_point()
         val col = at.col_at(tx)
         val row = row_at(m, at, ty)
 
-        c.take_focus(GRID)
+        c.take_focus(to)
+
         m.click(col, row, stretch)
 
         if m.double && !stretch && !m.editing then m.edit_existing()
     elif c.tapped(at.heads)
         val (tx, _) = c.tap_point()
 
-        c.take_focus(GRID)
+        c.take_focus(to)
+
         m.resizing = -1
 
         for k in 0..<at.cols.len()
@@ -286,7 +321,8 @@ private point(m: &Model, c: *Canvas, at: Layout)
     elif c.tapped(at.numbers)
         val (_, ty) = c.tap_point()
 
-        c.take_focus(GRID)
+        c.take_focus(to)
+
         m.pick_row(row_at(m, at, ty), stretch)
     elif c.tapped(at.corner)
         c.take_focus(GRID)
@@ -294,7 +330,7 @@ private point(m: &Model, c: *Canvas, at: Layout)
 
     val (px, py) = c.pointer()
 
-    if c.grab(at.cells, DRAG_CELLS) && !m.editing
+    if c.grab(at.cells, DRAG_CELLS) && (!m.editing || m.pointing)
         // Held past an edge, the grid scrolls a row or a column a frame toward it.
         if py >= at.cells.bottom() then m.top = (m.top + 1).min(MAX_ROWS - 1)
         elif py < at.cells.y && m.top > 0 then m.top -= 1
@@ -369,7 +405,9 @@ private draw(m: &Model, c: *Canvas, r: Rect, at: Layout)
                 None -> ()
         None -> ()
 
-    if m.editing then draw_editor(m, c, at, th)
+    if m.editing
+        draw_references(m, c, at)
+        draw_editor(m, c, at, th)
 
     c.unclip()
     draw_heads(m, c, at, a, th)
@@ -432,12 +470,55 @@ private draw_editor(m: &Model, c: *Canvas, at: Layout, th: int)
 
         c.fill(Rect(s.x + PAD + lo, ty, hi - lo, th), HEADER_PICKED)
 
-    c.ink(INK)
-    c.text(Rect(s.x + PAD, ty, tw, th), m.text)
-    c.unink()
-    c.fill(Rect(s.x + PAD + c.text_x(m.text, m.sel.head), ty, 1, th), INK)
+    val spans = references(m.text)
+
+    if spans.len() == 0
+        c.ink(INK)
+        c.text(Rect(s.x + PAD, ty, tw, th), m.text)
+        c.unink()
+    else
+        // The text in runs: each reference in its colour, what lies between them in ink.
+        var from: usize = 0
+
+        for k in 0..<spans.len()
+            val r = spans[k]
+
+            run(m, c, s.x + PAD, ty, th, from, r.start, INK)
+            run(m, c, s.x + PAD, ty, th, r.start, r.stop, REF_COLOURS[k % 6])
+            from = r.stop
+
+        run(m, c, s.x + PAD, ty, th, from, m.text.len, INK)
+
+    // The caret only while the grid has the keyboard: typing in the formula bar shows its own.
+    if m.focused then c.fill(Rect(s.x + PAD + c.text_x(m.text, m.sel.head), ty, 1, th), INK)
+
     c.stroke(Rect(box.x - 1, box.y - 1, box.w + 1, box.h + 2), ACTIVE, 2)
 end draw_editor
+
+// The part of the text being typed from `start` to `stop`, in `colour`, where it falls on a line
+// starting at `x`.
+private run(m: &Model, c: *Canvas, x: int, y: int, th: int, start: usize, stop: usize, colour: u32)
+    if stop <= start then return
+
+    val part = m.text[start..<stop]
+    val left = c.text_x(m.text, start)
+
+    c.ink(colour)
+    c.text(Rect(x + left, y, c.text_size(part).w, th), part)
+    c.unink()
+
+// Each reference in the formula being typed, outlined in the grid in its colour: dashed for the one
+// being pointed at, as it moves.
+private draw_references(m: &Model, c: *Canvas, at: Layout)
+    val spans = references(m.text)
+
+    for k in 0..<spans.len()
+        val r = spans[k]
+        val dash = if m.pointing && r.start == m.ref_at then 4 else 0
+
+        on_screen(m, at, r.area) match
+            Some(b) -> c.stroke(Rect(b.x - 1, b.y - 1, b.w + 1, b.h + 1), REF_COLOURS[k % 6], 2, dash = dash)
+            None -> ()
 
 // The column letters, the row numbers and the corner, the selected ones picked out.
 private draw_heads(m: &Model, c: *Canvas, at: Layout, a: Area, th: int)

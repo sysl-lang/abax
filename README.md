@@ -56,7 +56,9 @@ app/abax-app --demo --select B4:D8 --shot shot.png
 ```
 
 `--shot` draws one frame with no window and writes it to a PNG; `--cell B2==SUM(A1:A9)` (repeatable),
-`--cut` and `--select` set the sheet up first, so the picture can be checked by a program.
+`--cut` and `--select` set the sheet up first, `--edit A16==SUM(` leaves a cell being typed into and
+`--point B4:D8` points at a range from it, and `--about` opens the About dialog, so the picture can
+be checked by a program.
 
 | Key | Does |
 |---|---|
@@ -74,6 +76,20 @@ app/abax-app --demo --select B4:D8 --shot shot.png
 | Ctrl+Z; Ctrl+Y or Ctrl+Shift+Z | undo; redo — every edit, a paste or an insertion being one step |
 | Ctrl+C, Ctrl+X, Ctrl+V | copy, cut, paste; Escape lets the dashed outline of a copy or cut go |
 | Ctrl+D, Ctrl+R | fill down, fill right |
+| a click, a drag, a column letter or row number, while typing a formula | point: writes `B4`, `B4:D8`, `C:C` or `5:5` into it |
+| arrows, Shift + an arrow, Shift + a click, while pointing | move the reference pointed at, or stretch it to a range |
+| Escape or Enter under Help → About | close the dialog |
+
+**Pointing** is Excel's. While a formula is being typed — in the cell or in the formula bar — and
+the caret stands where a reference may go, pointing at cells writes their reference at the caret
+instead of finishing the entry. A reference may go where the nearest character before the caret
+that is not a space is `=`, an operator (`+ - * / ^ & < >`), `(`, `,` or `:`, outside quoted text;
+after `=A1`, `=12` or `=SUM(A1)` a click finishes the entry as it always has. Pointing again
+replaces the reference just written, until something is typed after it. The arrows point only in a
+cell typed over, starting from the cell being typed into; after F2 they move the caret. Enter puts
+the formula in and moves on from the cell typed into, Escape throws all of it away. Each reference in
+the formula is drawn in its own colour, and the cells it names are outlined in that colour, dashed
+for the one being pointed at.
 
 **Copy and paste** follow Excel. A pasted formula moves its relative references by how far it
 travelled and keeps its `$` ones; one cell pasted into a selection fills it. A cut pasted *moves*
