@@ -1,0 +1,403 @@
+module sh.sysl.abax
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.text.to_upper
+
+// A sheet: the cells that hold something, and the graph of which formulas read which cells.
+//
+// **The store is sparse** -- a hash map from a cell's position to what it holds -- so a sheet of a
+// million addressable rows costs what is in it. **Recalculation is by dependency**: each formula's
+// precedents are recorded when it is parsed, a change recalculates exactly the cells that depend on
+// it, and they are worked out in topological order, found by Tarjan's strongly-connected-components
+// walk. A component of more than one cell, or a cell that reads itself, is a cycle, and every cell on
+// it is the circular-reference error rather than a loop that never ends.
+
+// What a cell was given: a constant, or a formula.
+enum Content
+    Constant(v: Value)
+    Formula(e: &Expr)
+
+// One stored cell: what was typed, what it means, what it last came to, and what it reads.
+struct Slot
+    input: string
+    content: Content
+    value: Value
+    reads: Buf[Area]
+
+// A formula cell that reads a range, so that a change anywhere inside it reaches the formula.
+struct Watch
+    area: Area
+    reader: long
+
+struct Sheet
+    name: string
+    cells: Map[long, Slot]
+    // For each cell named alone by some formula, the formula cells that name it.
+    readers: Map[long, Buf[long]]
+    // Every range some formula reads, with the formula reading it.
+    watches: Buf[Watch]
+    // The furthest column and row anything has been stored in, which bounds a walk of a whole column.
+    last_col: int
+    last_row: int
+
+    // --- Reading ------------------------------------------------------------------------------------
+
+    // What the cell at a position comes to; an empty cell is `Empty`.
+    value_at(self, col: int, row: int) -> Value
+        self.cells.get(key(col, row)) match
+            Some(slot) -> slot.value
+            None -> Empty
+
+    // What the cell at an address comes to; an address that is not one is `#REF!`.
+    value(self, addr: string) -> Value
+        parse_ref(addr) match
+            Some(r) -> self.value_at(r.col, r.row)
+            None -> Error(BadRef)
+
+    // What was typed into a cell, exactly; "" for an empty one.
+    input(self, addr: string) -> string
+        val r = parse_ref(addr) match
+            Some(got) -> got
+            None -> return ""
+
+        self.cells.get(key(r.col, r.row)) match
+            Some(slot) -> slot.input
+            None -> ""
+    end input
+
+    // What the cell shows: its value in General format.
+    display(self, addr: string) -> string = self.value(addr).display()
+
+    // A formula cell's formula in canonical form, with its `=`, or nothing if the cell has none.
+    formula(self, addr: string) -> Option[string]
+        val r = parse_ref(addr)?
+        val slot = self.cells.get(key(r.col, r.row))?
+
+        slot.content match
+            Formula(e) -> Some("=" + formula_text(e))
+            Constant(_) -> None
+    end formula
+
+    // How many cells hold something.
+    count(self) -> usize = self.cells.len()
+
+    // The values of the stored cells inside an area, in no particular order. It walks whichever is
+    // smaller, the area or the store, so `A:A` on a small sheet does not visit a million rows.
+    stored_in(self, a: Area) -> Buf[Value]
+        var out: Buf[Value] = buf()
+        val c = self.clamp(a)
+
+        if c.col2 < c.col1 || c.row2 < c.row1 then return out
+
+        if c.size() <= long(self.cells.len())
+            for r in c.row1..c.row2 + 1
+                for k in c.col1..c.col2 + 1
+                    self.cells.get(key(k, r)) match
+                        Some(slot) -> out.push(slot.value)
+                        None -> ()
+        else
+            for (k, slot) in self.cells
+                if c.contains(col_of(k), row_of(k)) then out.push(slot.value)
+
+        out
+    end stored_in
+
+    // An area cut down to the part of the sheet anything has been stored in. It may come out empty,
+    // with its second corner before its first.
+    clamp(self, a: Area) -> Area = Area(a.col1, a.row1, a.col2.min(self.last_col), a.row2.min(self.last_row))
+
+    // --- Writing ------------------------------------------------------------------------------------
+
+    // A cell set from what a person typed, and everything that depends on it recalculated. `=` starts
+    // a formula; `'` makes the rest text whatever it looks like; otherwise a number, TRUE or FALSE, an
+    // error code, or text. "" empties the cell. A formula that does not parse is refused, the cell is
+    // left as it was, and the answer says what was wrong.
+    set(*self, addr: string, input: string) -> Result[unit, string]
+        val r = parse_ref(addr) match
+            Some(got) -> got
+            None -> return Err(s"'${addr}' is not a cell address")
+
+        self.set_at(r.col, r.row, input)
+    end set
+
+    set_at(*self, col: int, row: int, input: string) -> Result[unit, string]
+        if col < 0 || col >= MAX_COLS || row < 0 || row >= MAX_ROWS then return Err("the cell is outside the sheet")
+
+        val k = key(col, row)
+        val content = if input.len == 0 then Constant(Empty) else read_input(input)?
+
+        self.unlink(k)
+
+        content match
+            Constant(Empty) -> val _ = self.cells.remove(k)
+            Constant(v) -> self.cells.put(k, Slot(input, content, v, buf()))
+            Formula(e) ->
+                val reads = precedents(e, self.name)
+
+                self.cells.put(k, Slot(input, content, Empty, reads))
+                self.link(k, reads)
+
+        if input.len > 0
+            self.last_col = self.last_col.max(col)
+            self.last_row = self.last_row.max(row)
+
+        self.recalculate_from(k)
+        Ok(())
+    end set_at
+
+    // Every formula on the sheet worked out again, in dependency order.
+    recalculate(*self)
+        var all: Buf[long] = buf()
+
+        for (k, slot) in self.cells
+            slot.content match
+                Formula(_) -> all.push(k)
+                Constant(_) -> ()
+
+        self.recalculate_cells(all)
+    end recalculate
+
+    // --- The dependency graph -----------------------------------------------------------------------
+
+    // The formula cells that read the cell `k`, alone or inside a range.
+    dependents(self, k: long) -> Buf[long]
+        var out: Buf[long] = buf()
+
+        self.readers.get(k) match
+            Some(rs) ->
+                for i in 0..<rs.len()
+                    out.push(rs.at(i))
+            None -> ()
+
+        val col = col_of(k)
+        val row = row_of(k)
+
+        for i in 0..<self.watches.len()
+            val w = self.watches.at(i)
+
+            if w.area.contains(col, row) then out.push(w.reader)
+
+        out
+    end dependents
+
+    private link(*self, k: long, reads: Buf[Area])
+        for i in 0..<reads.len()
+            val a = reads.at(i)
+
+            if a.is_cell()
+                val at = key(a.col1, a.row1)
+                var rs = self.readers.get(at).unwrap_or(buf())
+
+                rs.push(k)
+                self.readers.put(at, rs)
+            else
+                self.watches.push(Watch(a, k))
+    end link
+
+    // The cell `k`'s formula forgotten from the graph, before it is replaced.
+    private unlink(*self, k: long)
+        val old = self.cells.get(k) match
+            Some(slot) -> slot.reads
+            None -> return
+
+        for i in 0..<old.len()
+            val a = old.at(i)
+
+            if a.is_cell()
+                val at = key(a.col1, a.row1)
+
+                self.readers.get(at) match
+                    Some(rs) ->
+                        var kept: Buf[long] = buf()
+
+                        for j in 0..<rs.len()
+                            if rs.at(j) != k then kept.push(rs.at(j))
+
+                        if kept.len() == 0 then val _ = self.readers.remove(at) else self.readers.put(at, kept)
+                    None -> ()
+
+        var kept: Buf[Watch] = buf()
+
+        for i in 0..<self.watches.len()
+            if self.watches.at(i).reader != k then kept.push(self.watches.at(i))
+
+        self.watches = kept
+    end unlink
+
+    // The cell `k` changed: it and everything that depends on it, however indirectly, recalculated.
+    private recalculate_from(*self, k: long)
+        var seen: Map[long, bool] = map()
+        var todo: Buf[long] = buf()
+        var all: Buf[long] = buf()
+
+        seen.put(k, true)
+        todo.push(k)
+
+        while todo.len() > 0
+            val at = todo.pop().unwrap()
+
+            all.push(at)
+
+            val ds = self.dependents(at)
+
+            for i in 0..<ds.len()
+                if !seen.has(ds.at(i))
+                    seen.put(ds.at(i), true)
+                    todo.push(ds.at(i))
+
+        self.recalculate_cells(all)
+    end recalculate_from
+
+    // Some cells recalculated, every one of them after the cells it reads among them. The graph is the
+    // cells and, from each, an edge to each of them it reads; Tarjan's walk hands back its strongly
+    // connected components with every component after the ones it reaches, which is the order to work
+    // them out in.
+    private recalculate_cells(*self, cells: Buf[long])
+        var index: Map[long, usize] = map()
+
+        for i in 0..<cells.len()
+            index.put(cells.at(i), i)
+
+        var g = graph(cells.len())
+
+        for i in 0..<cells.len()
+            val ds = self.dependents(cells.at(i))
+
+            for j in 0..<ds.len()
+                index.get(ds.at(j)) match
+                    Some(d) -> g.edge(d, i)
+                    None -> ()
+
+        val order = g.components()
+
+        for c in 0..<order.len()
+            val comp = order.at(c)
+            val cyclic = comp.len() > 1 || g.reads_itself(comp.at(0))
+
+            for m in 0..<comp.len()
+                val at = cells.at(comp.at(m))
+
+                self.cells.get(at) match
+                    Some(slot) ->
+                        slot.content match
+                            Formula(e) ->
+                                val v = if cyclic then Error(Circular) else evaluate(*self, e)
+
+                                self.cells.put(at, Slot(slot.input, slot.content, v, slot.reads))
+                            Constant(_) -> ()
+                    None -> ()
+    end recalculate_cells
+end Sheet
+
+// An empty sheet called `name`.
+sheet(name: string) -> Sheet = Sheet(name, map(), map(), buf(), -1, -1)
+
+// What some typed input means: a formula after `=`, text after `'`, else a number, a logical, an error
+// code, or text.
+read_input(input: string) -> Result[Content, string]
+    if input.starts_with("=") && input.len > 1 then return Ok(Formula(parse_formula(input[1..])?))
+    if input.starts_with("'") then return Ok(Constant(Text(input[1..])))
+
+    number_of(input) match
+        Some(x) -> return Ok(Constant(Number(x)))
+        None -> ()
+
+    val upper = to_upper(input)
+
+    if upper == "TRUE" then return Ok(Constant(Bool(true)))
+    if upper == "FALSE" then return Ok(Constant(Bool(false)))
+
+    fault_named(input) match
+        Some(f) -> Ok(Constant(Error(f)))
+        None -> Ok(Constant(Text(input)))
+end read_input
+
+// A cell's position as one number, the key of the store.
+key(col: int, row: int) -> long = long(row) * long(MAX_COLS) + long(col)
+
+col_of(k: long) -> int = int(k % long(MAX_COLS))
+
+row_of(k: long) -> int = int(k / long(MAX_COLS))
+
+// --- Tarjan's walk ----------------------------------------------------------------------------------
+
+// A directed graph over nodes `0..<n`, and the strongly connected components of it.
+private struct Graph
+    edges: Buf[Buf[usize]]
+    // Per node: the order it was reached in (0 for not yet), the lowest order reachable from it, and
+    // whether it is on the walk's stack.
+    order: Buf[usize]
+    low: Buf[usize]
+    on_stack: Buf[bool]
+    stack: Buf[usize]
+    next: usize
+    out: Buf[Buf[usize]]
+
+    edge(*self, from: usize, to: usize)
+        var es = self.edges.at(from)
+
+        es.push(to)
+        self.edges.set(from, es)
+
+    reads_itself(self, n: usize) -> bool
+        val es = self.edges.at(n)
+
+        for i in 0..<es.len()
+            if es.at(i) == n then return true
+
+        false
+    end reads_itself
+
+    // The components, each after every component it has an edge into.
+    components(*self) -> Buf[Buf[usize]]
+        for n in 0..<self.edges.len()
+            if self.order.at(n) == 0 then self.visit(n)
+
+        self.out
+    end components
+
+    private visit(*self, n: usize)
+        self.next += 1
+        self.order.set(n, self.next)
+        self.low.set(n, self.next)
+        self.stack.push(n)
+        self.on_stack.set(n, true)
+
+        val es = self.edges.at(n)
+
+        for i in 0..<es.len()
+            val m = es.at(i)
+
+            if self.order.at(m) == 0
+                self.visit(m)
+                self.low.set(n, self.low.at(n).min(self.low.at(m)))
+            elif self.on_stack.at(m)
+                self.low.set(n, self.low.at(n).min(self.order.at(m)))
+
+        if self.low.at(n) == self.order.at(n)
+            var comp: Buf[usize] = buf()
+
+            loop
+                val m = self.stack.pop().unwrap()
+
+                self.on_stack.set(m, false)
+                comp.push(m)
+
+                if m == n then break
+
+            self.out.push(comp)
+    end visit
+end Graph
+
+private graph(n: usize) -> Graph
+    var g = Graph(buf(), buf(), buf(), buf(), buf(), 0, buf())
+
+    for i in 0..<n
+        g.edges.push(buf())
+        g.order.push(0)
+        g.low.push(0)
+        g.on_stack.push(false)
+
+    g
+end graph

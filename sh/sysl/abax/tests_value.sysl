@@ -1,0 +1,135 @@
+module sh.sysl.abax
+@tests
+
+// --- General format ---------------------------------------------------------------------------------
+
+@test("General format writes integers whole up to eleven digits")
+general_integers()
+    assert_eq(general(0.0), "0")
+    assert_eq(general(1.0), "1")
+    assert_eq(general(-42.0), "-42")
+    assert_eq(general(99999999999.0), "99999999999")
+    assert_eq(general(12345678901.0), "12345678901")
+
+@test("General format switches to scientific at twelve digits, as Excel does")
+general_large()
+    assert_eq(general(100000000000.0), "1E+11")
+    assert_eq(general(123456789012.0), "1.23457E+11")
+    assert_eq(general(-123456789012.0), "-1.23457E+11")
+    // Rounding carries an eleven-digit value into a twelfth, so it no longer fits.
+    assert_eq(general(99999999999.6), "1E+11")
+    assert_eq(general(1e100), "1E+100")
+    assert_eq(general(1.23456789e100), "1.2346E+100")
+    assert_eq(general(1.7976931348623157e308), "1.7977E+308")
+
+@test("General format rounds a fraction to fit eleven characters")
+general_fractions()
+    assert_eq(general(1.0 / 3.0), "0.333333333")
+    assert_eq(general(2.0 / 3.0), "0.666666667")
+    assert_eq(general(0.1 + 0.2), "0.3")
+    assert_eq(general(1234567.891234), "1234567.891")
+    assert_eq(general(0.5), "0.5")
+    assert_eq(general(-0.25), "-0.25")
+    assert_eq(general(3.14159265358979), "3.141592654")
+
+@test("General format writes small numbers fixed down to 1E-09 and scientific below")
+general_small()
+    assert_eq(general(0.000123456789012), "0.000123457")
+    assert_eq(general(0.000000001), "0.000000001")
+    assert_eq(general(0.0000000001), "1E-10")
+    assert_eq(general(1.5e-10), "1.5E-10")
+    assert_eq(general(1.23456789e-200), "1.2346E-200")
+    assert_eq(general(5e-324), "4.9407E-324")
+
+@test("a value displays as a cell shows it")
+value_display()
+    assert_eq(Empty.display(), "")
+    assert_eq(Number(2.5).display(), "2.5")
+    assert_eq(Text("hi").display(), "hi")
+    assert_eq(Bool(true).display(), "TRUE")
+    assert_eq(Bool(false).display(), "FALSE")
+    assert_eq(Error(DivByZero).display(), "#DIV/0!")
+    assert_eq(Error(Circular).display(), "#CIRC!")
+
+@test("every fault has its code, and every code but the circular one reads back")
+fault_codes()
+    for f in [DivByZero, WrongType, BadRef, BadName, NotAvailable, BadNumber, NullRange]
+        assert(fault_named(f.text()) == Some(f))
+
+    assert(fault_named("#n/a") == Some(NotAvailable))
+    assert(fault_named("#CIRC!").is_none())
+    assert(fault_named("#WHAT!").is_none())
+
+// --- Numbers as text --------------------------------------------------------------------------------
+
+@test("a number as text for concatenation has fifteen significant digits")
+number_as_text()
+    assert_eq(number_text(1.0 / 3.0), "0.333333333333333")
+    assert_eq(number_text(0.1 + 0.2), "0.3")
+    assert_eq(number_text(42.0), "42")
+    assert_eq(number_text(-1.5), "-1.5")
+    assert_eq(number_text(1e20), "1E+20")
+    assert_eq(number_text(1.0 / 0.0), "#NUM!")
+
+@test("the shortest text of a real reads back to the same real")
+shortest_round_trip()
+    assert_eq(shortest_text(0.1), "0.1")
+    assert_eq(shortest_text(0.1 + 0.2), "0.30000000000000004")
+    assert_eq(shortest_text(1e300), "1e+300")
+    assert_eq(shortest_text(100.0), "100")
+    assert_eq(shortest_text(-2.5), "-2.5")
+
+    for x in [0.1, 1.0 / 3.0, 2.0 / 3.0, 123456.789, 1e-300, 5e-324, 1.7976931348623157e308, -7.25]
+        assert(number_of(shortest_text(x)) == Some(x))
+
+// --- Reading numbers --------------------------------------------------------------------------------
+
+@test("text reads as a number the way a cell reads one")
+numbers_from_text()
+    assert(number_of("3") == Some(3.0))
+    assert(number_of("  -2.5 ") == Some(-2.5))
+    assert(number_of("+.5") == Some(0.5))
+    assert(number_of("1e3") == Some(1000.0))
+    assert(number_of("1E-2") == Some(0.01))
+    assert(number_of("50%") == Some(0.5))
+    assert(number_of("7.") == Some(7.0))
+
+@test("text that only a C reader would take is not a number")
+numbers_refused()
+    assert(number_of("").is_none())
+    assert(number_of(" ").is_none())
+    assert(number_of("abc").is_none())
+    assert(number_of("inf").is_none())
+    assert(number_of("nan").is_none())
+    assert(number_of("0x10").is_none())
+    assert(number_of("1e").is_none())
+    assert(number_of("1.2.3").is_none())
+    assert(number_of(".").is_none())
+    assert(number_of("-").is_none())
+    assert(number_of("%").is_none())
+
+// --- Coercion ---------------------------------------------------------------------------------------
+
+@test("a value coerces to a number as Excel's arithmetic does")
+coerce_number()
+    assert(to_number(Empty) == Ok(0.0))
+    assert(to_number(Bool(true)) == Ok(1.0))
+    assert(to_number(Bool(false)) == Ok(0.0))
+    assert(to_number(Text(" 4 ")) == Ok(4.0))
+    assert(to_number(Text("four")) == Err(WrongType))
+    assert(to_number(Text("")) == Err(WrongType))
+    assert(to_number(Error(NotAvailable)) == Err(NotAvailable))
+
+@test("a value coerces to text and to a logical")
+coerce_text_and_bool()
+    assert(to_text(Empty) == Ok(""))
+    assert(to_text(Number(3.0)) == Ok("3"))
+    assert(to_text(Bool(true)) == Ok("TRUE"))
+    assert(to_text(Error(BadRef)) == Err(BadRef))
+    assert(to_bool(Number(0.0)) == Ok(false))
+    assert(to_bool(Number(-2.0)) == Ok(true))
+    assert(to_bool(Text("true")) == Ok(true))
+    assert(to_bool(Text("False")) == Ok(false))
+    assert(to_bool(Text("yes")) == Err(WrongType))
+    assert(to_bool(Empty) == Ok(false))
+    assert(to_bool(Error(BadNumber)) == Err(BadNumber))

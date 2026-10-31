@@ -1,0 +1,86 @@
+module sh.sysl.abax
+@tests
+
+@test("column letters and indices convert both ways, up to XFD")
+columns()
+    assert_eq(column_name(0), "A")
+    assert_eq(column_name(25), "Z")
+    assert_eq(column_name(26), "AA")
+    assert_eq(column_name(701), "ZZ")
+    assert_eq(column_name(702), "AAA")
+    assert_eq(column_name(16383), "XFD")
+    assert(column_index("A") == Some(0))
+    assert(column_index("az") == Some(51))
+    assert(column_index("XFD") == Some(16383))
+
+    for c in [0, 1, 25, 26, 27, 51, 52, 701, 702, 703, 16383]
+        assert(column_index(column_name(c)) == Some(c))
+
+@test("a column past XFD, or not made of letters, is none")
+columns_refused()
+    assert(column_index("XFE").is_none())
+    assert(column_index("ZZZ").is_none())
+    assert(column_index("AAAA").is_none())
+    assert(column_index("").is_none())
+    assert(column_index("A1").is_none())
+
+@test("a cell address reads with and without its dollar signs")
+addresses()
+    assert(parse_ref("A1") == Some(Ref(0, 0, false, false)))
+    assert(parse_ref("b7") == Some(Ref(1, 6, false, false)))
+    assert(parse_ref("$B$7") == Some(Ref(1, 6, true, true)))
+    assert(parse_ref("$B7") == Some(Ref(1, 6, true, false)))
+    assert(parse_ref("B$7") == Some(Ref(1, 6, false, true)))
+    assert(parse_ref("AA100") == Some(Ref(26, 99, false, false)))
+    assert_eq(Ref(1, 6, true, false).text(), "$B7")
+    assert_eq(Ref(1, 6, false, true).text(), "B$7")
+
+@test("the sheet's last cell is XFD1048576, and one past it either way is not an address")
+address_limits()
+    assert(parse_ref("XFD1048576") == Some(Ref(16383, 1048575, false, false)))
+    assert(parse_ref("XFE1").is_none())
+    assert(parse_ref("A1048577").is_none())
+    assert(parse_ref("A99999999999999999999").is_none())
+
+@test("things that are not one cell's address are refused")
+addresses_refused()
+    assert(parse_ref("").is_none())
+    assert(parse_ref("A").is_none())
+    assert(parse_ref("1").is_none())
+    assert(parse_ref("A0").is_none())
+    assert(parse_ref("A1:B2").is_none())
+    assert(parse_ref("$$A1").is_none())
+    assert(parse_ref("A$").is_none())
+    assert(parse_ref("1A").is_none())
+    assert(parse_ref("A 1").is_none())
+
+@test("an area always has its smaller corner first, and whole columns and rows span the sheet")
+areas()
+    val a = area_of(at(2, 9), at(0, 0))
+
+    assert(a == Area(0, 0, 2, 9))
+    assert_eq(a.width(), 3)
+    assert_eq(a.height(), 10)
+    assert(a.contains(1, 5))
+    assert(!a.contains(3, 5))
+
+    val col = area_of(Ref(0, -1, false, false), Ref(1, -1, false, false))
+
+    assert(col == Area(0, 0, 1, MAX_ROWS - 1))
+
+    val row = area_of(Ref(-1, 2, false, false), Ref(-1, 2, false, false))
+
+    assert(row == Area(0, 2, MAX_COLS - 1, 2))
+    assert(area_of(at(0, 0), at(MAX_COLS - 1, MAX_ROWS - 1)).size() == 17179869184)
+
+@test("a sheet name is written bare when it can be, and quoted when it cannot")
+sheet_names()
+    assert_eq(sheet_prefix(""), "")
+    assert_eq(sheet_prefix("Sheet2"), "Sheet2!")
+    assert_eq(sheet_prefix("My sheet"), "'My sheet'!")
+    assert_eq(sheet_prefix("Bob's"), "'Bob''s'!")
+    assert_eq(sheet_prefix("2024"), "'2024'!")
+    // A name that reads as a cell address has to be quoted, or it would be one.
+    assert_eq(sheet_prefix("A1"), "'A1'!")
+    assert(same_sheet("sheet1", "SHEET1"))
+    assert(!same_sheet("Sheet1", "Sheet2"))

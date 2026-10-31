@@ -1,0 +1,12 @@
+module sh.sysl.abax
+@tests
+
+@test("a formula reads the cells it names")
+sheet_basics()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "2").unwrap()
+    s.set("A2", "=A1*3").unwrap()
+    assert_eq(s.display("A2"), "6")
+    s.set("A1", "5").unwrap()
+    assert_eq(s.display("A2"), "15")

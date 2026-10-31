@@ -1,0 +1,645 @@
+module sh.sysl.abax
+
+import sysl.buf.{Buf, buf}
+import sysl.fmt.format_real
+import sysl.text.{parse_real, str_builder, to_lower, to_upper}
+
+// Working a formula out against a sheet.
+//
+// **A function's argument is either a value or a range**, and the difference matters: `SUM(A1:A3)`
+// skips the text in the range while `SUM("3")` reads its text as a number, and a single cell named as
+// an argument (`SUM(A1)`) is a range of one. Everything that is not a reference is a value.
+
+// One argument as a function receives it.
+private enum Arg
+    Scalar(v: Value)
+    Range(a: Area)
+
+// What a formula comes to. An empty answer (`=A1` of an empty cell) is shown as 0, and a number that
+// is not finite is `#NUM!`.
+evaluate(s: Sheet, e: &Expr) -> Value
+    eval(s, e) match
+        Empty -> Number(0.0)
+        Number(x) -> if x.is_finite() then Number(x) else Error(BadNumber)
+        v -> v
+end evaluate
+
+// An expression's value where one value is wanted.
+private eval(s: Sheet, e: &Expr) -> Value
+    *e match
+        Literal(v) -> v
+        CellRef(sheet, r) -> if on_sheet(s, sheet) then s.value_at(r.col, r.row) else Error(BadRef)
+        RangeRef(sheet, a, b) ->
+            if !on_sheet(s, sheet) then return Error(BadRef)
+
+            val area = area_of(a, b)
+
+            // A range where one value is wanted is an error unless it is one cell.
+            if area.is_cell() then s.value_at(area.col1, area.row1) else Error(WrongType)
+        Name(_) -> Error(BadName)
+        Negate(x) -> number_or_fault(to_number(eval(s, x)), (n) -> -n)
+        Posit(x) -> eval(s, x)
+        PercentOf(x) -> number_or_fault(to_number(eval(s, x)), (n) -> n / 100.0)
+        Binary(op, a, b) -> binary(op, eval(s, a), eval(s, b))
+        Call(name, args) ->
+            call(s, name, args) match
+                Ok(v) -> v
+                Err(f) -> Error(f)
+        Group(x) -> eval(s, x)
+        Missing -> Empty
+end eval
+
+private number_or_fault(r: Result[real, Fault], f: real -> real) -> Value
+    r match
+        Ok(x) -> Number(f(x))
+        Err(e) -> Error(e)
+
+// Whether a reference's sheet name is this sheet: no name is, and so is this sheet's own.
+private on_sheet(s: Sheet, sheet: string) -> bool = sheet.len == 0 || same_sheet(sheet, s.name)
+
+// An argument as a function receives it: a reference is a range, anything else is its value.
+private arg(s: Sheet, e: &Expr) -> Arg
+    *e match
+        CellRef(sheet, r) -> if on_sheet(s, sheet) then Range(area_of(r, r)) else Scalar(Error(BadRef))
+        RangeRef(sheet, a, b) -> if on_sheet(s, sheet) then Range(area_of(a, b)) else Scalar(Error(BadRef))
+        Group(x) -> arg(s, x)
+        _ -> Scalar(eval(s, e))
+end arg
+
+// --- Operators --------------------------------------------------------------------------------------
+
+private binary(op: BinOp, a: Value, b: Value) -> Value
+    // An error on either side is the answer, the left one first.
+    if a.is_error() then return a
+    if b.is_error() then return b
+
+    op match
+        Concat ->
+            Text(to_text(a).unwrap() + to_text(b).unwrap())
+        Equal -> Bool(compare(a, b) == 0)
+        NotEqual -> Bool(compare(a, b) != 0)
+        Less -> Bool(compare(a, b) < 0)
+        Greater -> Bool(compare(a, b) > 0)
+        LessEqual -> Bool(compare(a, b) <= 0)
+        GreaterEqual -> Bool(compare(a, b) >= 0)
+        _ ->
+            val x = to_number(a) match
+                Ok(n) -> n
+                Err(f) -> return Error(f)
+            val y = to_number(b) match
+                Ok(n) -> n
+                Err(f) -> return Error(f)
+
+            arithmetic(op, x, y)
+end binary
+
+private arithmetic(op: BinOp, x: real, y: real) -> Value
+    val r = op match
+        Add -> x + y
+        Sub -> x - y
+        Mul -> x * y
+        Div ->
+            if y == 0.0 then return Error(DivByZero)
+
+            x / y
+        // `x ^ y` as Excel has it: `0^0` and a root of a negative number are `#NUM!`, and `0` to a
+        // negative power is `#DIV/0!`.
+        _ ->
+            if x == 0.0 && y == 0.0 then return Error(BadNumber)
+            if x == 0.0 && y < 0.0 then return Error(DivByZero)
+
+            x.pow(y)
+
+    if r.is_finite() then Number(r) else Error(BadNumber)
+end arithmetic
+
+// How two values order, as a comparison operator sees them: numbers before text before logicals, text
+// without regard to case, and an empty cell as the other side's kind of nothing.
+compare(a: Value, b: Value) -> int
+    val l = blank_as(a, b)
+    val r = blank_as(b, a)
+    val kl = kind_rank(l)
+    val kr = kind_rank(r)
+
+    if kl != kr then return if kl < kr then -1 else 1
+
+    l match
+        Number(x) ->
+            val y = to_number(r).unwrap()
+
+            if x < y then -1 elif x > y then 1 else 0
+        Text(t) ->
+            val u = to_upper(t)
+            val v = to_upper(to_text(r).unwrap())
+
+            if u < v then -1 elif u > v then 1 else 0
+        Bool(p) ->
+            val q = to_bool(r).unwrap()
+
+            if p == q then 0 elif q then -1 else 1
+        _ -> 0
+end compare
+
+// An empty value compared with something takes that thing's kind of nothing.
+private blank_as(v: Value, other: Value) -> Value
+    v match
+        Empty ->
+            other match
+                Text(_) -> Text("")
+                Bool(_) -> Bool(false)
+                _ -> Number(0.0)
+        _ -> v
+end blank_as
+
+private kind_rank(v: Value) -> int = v match
+    Text(_) -> 1
+    Bool(_) -> 2
+    _ -> 0
+
+// --- Functions --------------------------------------------------------------------------------------
+
+// Every function this engine knows, for a name box or an autocompleter.
+val FUNCTIONS = ["ABS", "AND", "AVERAGE", "CONCAT", "CONCATENATE", "COUNT", "COUNTA", "COUNTBLANK", "HLOOKUP",
+    "IF", "IFERROR", "INDEX", "INT", "ISBLANK", "ISERROR", "ISNUMBER", "ISTEXT", "LEFT", "LEN", "LOWER", "MATCH",
+    "MAX", "MID", "MIN", "MOD", "NOT", "OR", "PI", "POWER", "PRODUCT", "RIGHT", "ROUND", "ROUNDDOWN", "ROUNDUP",
+    "SQRT", "SUM", "TRIM", "UPPER", "VLOOKUP"]
+
+// A call, by name. A name not in `FUNCTIONS` is `#NAME?`; the wrong number of arguments is `#VALUE!`.
+private call(s: Sheet, name: string, args: Buf[&Expr]) -> Result[Value, Fault]
+    val n = args.len()
+
+    // The two that must not evaluate what they do not use.
+    if name == "IF"
+        arity(n, 1, 3)?
+
+        val cond = to_bool(eval(s, args.at(0)))?
+
+        if cond then return Ok(if n >= 2 then eval(s, args.at(1)) else Bool(true))
+
+        return Ok(if n == 3 then eval(s, args.at(2)) else Bool(false))
+
+    if name == "IFERROR"
+        arity(n, 2, 2)?
+
+        val v = eval(s, args.at(0))
+
+        return Ok(if v.is_error() then eval(s, args.at(1)) else v)
+
+    if name == "SUM" || name == "PRODUCT" || name == "AVERAGE" || name == "MIN" || name == "MAX"
+        arity(n, 1, 255)?
+
+        val xs = numbers(s, args)?
+
+        return Ok(Number(aggregate(name, xs)?))
+
+    if name == "COUNT" then return Ok(Number(real(count(s, args, false))))
+    if name == "COUNTA" then return Ok(Number(real(count(s, args, true))))
+
+    if name == "COUNTBLANK"
+        arity(n, 1, 1)?
+
+        return arg(s, args.at(0)) match
+            Range(a) -> Ok(Number(real(count_blank(s, a))))
+            Scalar(_) -> Err(WrongType)
+
+    if name == "AND" || name == "OR"
+        arity(n, 1, 255)?
+
+        val bs = truths(s, args)?
+
+        if bs.len() == 0 then return Err(WrongType)
+
+        var all = true
+        var any = false
+
+        for i in 0..<bs.len()
+            if bs.at(i) then any = true else all = false
+
+        return Ok(Bool(if name == "AND" then all else any))
+
+    if name == "NOT"
+        arity(n, 1, 1)?
+
+        return Ok(Bool(!to_bool(eval(s, args.at(0)))?))
+
+    if name == "ISBLANK" || name == "ISNUMBER" || name == "ISTEXT" || name == "ISERROR"
+        arity(n, 1, 1)?
+
+        val v = eval(s, args.at(0))
+        val answer = v match
+            Empty -> name == "ISBLANK"
+            Number(_) -> name == "ISNUMBER"
+            Text(_) -> name == "ISTEXT"
+            Error(_) -> name == "ISERROR"
+            Bool(_) -> false
+
+        return Ok(Bool(answer))
+
+    if name == "CONCAT" || name == "CONCATENATE"
+        arity(n, 1, 255)?
+
+        return Ok(Text(concat(s, args)?))
+
+    if name == "VLOOKUP" || name == "HLOOKUP"
+        arity(n, 3, 4)?
+
+        return lookup(s, args, name == "VLOOKUP")
+
+    if name == "INDEX"
+        arity(n, 2, 3)?
+
+        return index(s, args)
+
+    if name == "MATCH"
+        arity(n, 2, 3)?
+
+        return match_position(s, args)
+
+    if name == "PI"
+        arity(n, 0, 0)?
+
+        return Ok(Number(3.141592653589793))
+
+    if name == "LEFT" || name == "RIGHT" || name == "MID" || name == "LEN" || name == "UPPER" || name == "LOWER" || name == "TRIM"
+        return Ok(text_function(s, name, args)?)
+
+    math_function(s, name, args)
+end call
+
+private arity(n: usize, lo: usize, hi: usize) -> Result[unit, Fault] = if n < lo || n > hi then Err(WrongType) else Ok(())
+
+private number_at(s: Sheet, args: Buf[&Expr], i: usize) -> Result[real, Fault] = to_number(eval(s, args.at(i)))
+
+private math_function(s: Sheet, name: string, args: Buf[&Expr]) -> Result[Value, Fault]
+    val n = args.len()
+
+    if name == "ABS" || name == "INT" || name == "SQRT"
+        arity(n, 1, 1)?
+
+        val x = number_at(s, args, 0)?
+
+        if name == "ABS" then return Ok(Number(x.abs()))
+        if name == "INT" then return Ok(Number(x.floor()))
+        if x < 0.0 then return Err(BadNumber)
+
+        return Ok(Number(x.sqrt()))
+
+    if name == "ROUND" || name == "ROUNDUP" || name == "ROUNDDOWN"
+        arity(n, 2, 2)?
+
+        return Ok(Number(round_to(number_at(s, args, 0)?, number_at(s, args, 1)?.trunc(), name)))
+
+    if name == "MOD"
+        arity(n, 2, 2)?
+
+        val x = number_at(s, args, 0)?
+        val d = number_at(s, args, 1)?
+
+        if d == 0.0 then return Err(DivByZero)
+
+        // The answer takes the divisor's sign: MOD(-3, 2) is 1.
+        return Ok(Number(x - d * (x / d).floor()))
+
+    if name == "POWER"
+        arity(n, 2, 2)?
+
+        return Ok(arithmetic(Pow, number_at(s, args, 0)?, number_at(s, args, 1)?))
+
+    Err(BadName)
+end math_function
+
+// `x` rounded to `places` decimal places (left of the point when negative): to the nearer, half away
+// from zero, for ROUND; away from zero for ROUNDUP; toward it for ROUNDDOWN.
+//
+// **The scaled value is first cut to fifteen significant digits**, as Excel does, so that 2.675 -- held
+// as 2.67499999999999982236431605997495353221893310546875 -- rounds to 2.68 as typed, and not to the
+// 2.67 its binary value would give.
+private round_to(x: real, places: real, how: string) -> real
+    val k = places.abs().min(308.0)
+    val scale = 10.0.pow(k)
+    val scaled = if places >= 0.0 then x * scale else x / scale
+    val cut = parse_real(format_real(scaled, "%.*e", 0, 14)).unwrap_or(scaled)
+    var whole = cut.trunc()
+
+    if how == "ROUND" then whole = cut.round()
+    elif how == "ROUNDUP" then whole = if cut < 0.0 then -((-cut).ceil()) else cut.ceil()
+
+    if places >= 0.0 then whole / scale else whole * scale
+end round_to
+
+// The numbers a SUM-like function takes from its arguments. From a range only numbers count, and text,
+// logicals and empty cells are skipped; an argument typed directly is read as a number, so TRUE is 1
+// and "3" is 3, and text that is not a number is `#VALUE!`. An error anywhere is the answer.
+private numbers(s: Sheet, args: Buf[&Expr]) -> Result[Buf[real], Fault]
+    var out: Buf[real] = buf()
+
+    for i in 0..<args.len()
+        arg(s, args.at(i)) match
+            Range(a) ->
+                val vs = s.stored_in(a)
+
+                for j in 0..<vs.len()
+                    vs.at(j) match
+                        Number(x) -> out.push(x)
+                        Error(f) -> return Err(f)
+                        _ -> ()
+            Scalar(v) ->
+                v match
+                    Empty -> ()
+                    _ -> out.push(to_number(v)?)
+
+    Ok(out)
+end numbers
+
+private aggregate(name: string, xs: Buf[real]) -> Result[real, Fault]
+    if name == "SUM"
+        var t = 0.0
+
+        for i in 0..<xs.len()
+            t += xs.at(i)
+
+        return Ok(t)
+
+    // Nothing to multiply, average, or compare: PRODUCT, MIN and MAX of nothing are 0.
+    if xs.len() == 0 then return if name == "AVERAGE" then Err(DivByZero) else Ok(0.0)
+
+    var r = if name == "PRODUCT" then 1.0 elif name == "AVERAGE" then 0.0 else xs.at(0)
+
+    for i in 0..<xs.len()
+        val x = xs.at(i)
+
+        if name == "PRODUCT" then r *= x
+        elif name == "AVERAGE" then r += x
+        elif name == "MIN" then r = r.min(x)
+        else r = r.max(x)
+
+    Ok(if name == "AVERAGE" then r / real(xs.len()) else r)
+end aggregate
+
+// COUNT counts the numbers -- in a range only numbers, among the arguments anything that reads as one;
+// COUNTA counts everything that is not empty. Neither is stopped by an error.
+private count(s: Sheet, args: Buf[&Expr], all: bool) -> long
+    var c: long = 0
+
+    for i in 0..<args.len()
+        arg(s, args.at(i)) match
+            Range(a) ->
+                val vs = s.stored_in(a)
+
+                for j in 0..<vs.len()
+                    vs.at(j) match
+                        Number(_) -> c += 1
+                        Empty -> ()
+                        _ -> if all then c += 1
+            Scalar(v) ->
+                if all then c += 1
+                elif to_number(v).is_ok() then
+                    v match
+                        Empty -> ()
+                        _ -> c += 1
+
+    c
+end count
+
+// The cells of an area that are empty or hold empty text.
+private count_blank(s: Sheet, a: Area) -> long
+    val vs = s.stored_in(a)
+    var filled: long = 0
+
+    for j in 0..<vs.len()
+        vs.at(j) match
+            Text(t) -> if t.len > 0 then filled += 1
+            Empty -> ()
+            _ -> filled += 1
+
+    a.size() - filled
+end count_blank
+
+// The logicals AND and OR take: from a range, numbers and logicals, skipping text and empty cells;
+// from an argument, its value as a logical.
+private truths(s: Sheet, args: Buf[&Expr]) -> Result[Buf[bool], Fault]
+    var out: Buf[bool] = buf()
+
+    for i in 0..<args.len()
+        arg(s, args.at(i)) match
+            Range(a) ->
+                val vs = s.stored_in(a)
+
+                for j in 0..<vs.len()
+                    vs.at(j) match
+                        Number(x) -> out.push(x != 0.0)
+                        Bool(b) -> out.push(b)
+                        Error(f) -> return Err(f)
+                        _ -> ()
+            Scalar(v) -> out.push(to_bool(v)?)
+
+    Ok(out)
+end truths
+
+// Every argument's text joined, a range's cells row by row.
+private concat(s: Sheet, args: Buf[&Expr]) -> Result[string, Fault]
+    var sb = str_builder()
+
+    for i in 0..<args.len()
+        arg(s, args.at(i)) match
+            Range(a) ->
+                val c = s.clamp(a)
+
+                for r in c.row1..c.row2 + 1
+                    for k in c.col1..c.col2 + 1
+                        sb.push(to_text(s.value_at(k, r))?)
+            Scalar(v) -> sb.push(to_text(v)?)
+
+    Ok(sb.finish())
+end concat
+
+// --- Text -------------------------------------------------------------------------------------------
+
+private text_function(s: Sheet, name: string, args: Buf[&Expr]) -> Result[Value, Fault]
+    val n = args.len()
+
+    if name == "MID" then arity(n, 3, 3)?
+    elif name == "LEFT" || name == "RIGHT" then arity(n, 1, 2)?
+    else arity(n, 1, 1)?
+
+    val t = to_text(eval(s, args.at(0)))?
+
+    if name == "LEN" then return Ok(Number(real(char_starts(t).len() - 1)))
+    if name == "UPPER" then return Ok(Text(to_upper(t)))
+    if name == "LOWER" then return Ok(Text(to_lower(t)))
+    if name == "TRIM" then return Ok(Text(trim_spaces(t)))
+
+    val at = char_starts(t)
+    val chars = at.len() - 1
+
+    if name == "MID"
+        val start = number_at(s, args, 1)?.trunc()
+        val count = number_at(s, args, 2)?.trunc()
+
+        if start < 1.0 || count < 0.0 then return Err(WrongType)
+
+        val lo = if start - 1.0 >= real(chars) then chars else usize(start) - 1
+        val hi = if real(lo) + count >= real(chars) then chars else lo + usize(count)
+
+        return Ok(Text(t[at.at(lo)..<at.at(hi)]))
+
+    val count = if n == 2 then number_at(s, args, 1)?.trunc() else 1.0
+
+    if count < 0.0 then return Err(WrongType)
+
+    val k = if count >= real(chars) then chars else usize(count)
+
+    Ok(Text(if name == "LEFT" then t[0..<at.at(k)] else t[at.at(chars - k)..<t.len]))
+end text_function
+
+// Where each character of some text starts, and its length at the end: text of `n` characters has
+// `n + 1` entries.
+private char_starts(t: string) -> Buf[usize]
+    var out: Buf[usize] = buf()
+    val b = t.bytes
+
+    for i in 0..<b.len
+        if (b[i] & 0xC0) != 0x80 then out.push(i)
+
+    out.push(b.len)
+    out
+end char_starts
+
+// TRIM: no spaces at either end, and one between words where there were several.
+private trim_spaces(t: string) -> string
+    var sb = str_builder()
+    var pending = false
+    var any = false
+
+    for ch in t.chars
+        if ch == ' '
+            pending = any
+        else
+            if pending then sb.push_char(' ')
+
+            sb.push_char(ch)
+            pending = false
+            any = true
+
+    sb.finish()
+end trim_spaces
+
+// --- Lookups ----------------------------------------------------------------------------------------
+
+// The range an argument names, or `#VALUE!` if it is not one.
+private range_arg(s: Sheet, e: &Expr) -> Result[Area, Fault]
+    arg(s, e) match
+        Range(a) -> Ok(a)
+        Scalar(v) -> if v.is_error() then Err(to_number(v).unwrap_err()) else Err(WrongType)
+
+// Two values that a lookup takes as the same: the same kind and equal, text without regard to case.
+private same_key(a: Value, b: Value) -> bool
+    a match
+        Empty -> false
+        _ -> kind_rank(a) == kind_rank(b) && compare(a, b) == 0
+
+// The position in a sorted run where an approximate lookup lands: the last value of the key's kind not
+// past it, stopping at the first that is. `descending` turns the order round, for MATCH's -1.
+private approximate(s: Sheet, key: Value, cells: Buf[(int, int)], descending: bool) -> Option[usize]
+    var found: Option[usize] = None
+
+    for i in 0..<cells.len()
+        val v = s.value_at(cells.at(i).0, cells.at(i).1)
+
+        if kind_rank(v) == kind_rank(key) && !v.is_error()
+            v match
+                Empty -> ()
+                _ ->
+                    val c = compare(v, key)
+
+                    if (c <= 0 && !descending) || (c >= 0 && descending) then found = Some(i) else break
+
+    found
+end approximate
+
+// The cells of the first column (or row) of an area, as far as anything is stored.
+private line_of(s: Sheet, a: Area, down: bool) -> Buf[(int, int)]
+    val c = s.clamp(a)
+    var out: Buf[(int, int)] = buf()
+
+    if down
+        for r in c.row1..c.row2 + 1
+            out.push((c.col1, r))
+    else
+        for k in c.col1..c.col2 + 1
+            out.push((k, c.row1))
+
+    out
+end line_of
+
+// VLOOKUP and HLOOKUP: the key found in the table's first column (row), and the value so many columns
+// (rows) along. Approximate matching, the default, assumes the first column is sorted.
+private lookup(s: Sheet, args: Buf[&Expr], vertical: bool) -> Result[Value, Fault]
+    val key = eval(s, args.at(0))
+
+    if key.is_error() then return Ok(key)
+
+    val table = range_arg(s, args.at(1))?
+    val k = number_at(s, args, 2)?.trunc()
+    val approx = if args.len() == 4 then to_bool(eval(s, args.at(3)))? else true
+    val span = if vertical then table.width() else table.height()
+
+    if k < 1.0 then return Err(WrongType)
+    if k > real(span) then return Err(BadRef)
+
+    val cells = line_of(s, table, vertical)
+    val found = if approx then approximate(s, key, cells, false) else exact(s, key, cells)
+
+    found match
+        Some(i) ->
+            val at = cells.at(i)
+            val off = int(k) - 1
+
+            Ok(if vertical then s.value_at(at.0 + off, at.1) else s.value_at(at.0, at.1 + off))
+        None -> Err(NotAvailable)
+end lookup
+
+private exact(s: Sheet, key: Value, cells: Buf[(int, int)]) -> Option[usize]
+    for i in 0..<cells.len()
+        if same_key(s.value_at(cells.at(i).0, cells.at(i).1), key) then return Some(i)
+
+    None
+end exact
+
+// INDEX(range, row, [column]): the value at a position, counted from 1. A range one row high takes a
+// lone second argument as the column.
+private index(s: Sheet, args: Buf[&Expr]) -> Result[Value, Fault]
+    val a = range_arg(s, args.at(0))?
+    var r = number_at(s, args, 1)?.trunc()
+    var c = if args.len() == 3 then number_at(s, args, 2)?.trunc() else 1.0
+
+    if args.len() == 2 && a.height() == 1 && a.width() > 1
+        c = r
+        r = 1.0
+
+    if r < 1.0 || c < 1.0 then return Err(WrongType)
+    if r > real(a.height()) || c > real(a.width()) then return Err(BadRef)
+
+    Ok(s.value_at(a.col1 + int(c) - 1, a.row1 + int(r) - 1))
+end index
+
+// MATCH(key, range, [type]): where the key is in a single row or column, counted from 1. Type 0 is an
+// exact match; 1, the default, the last value not above the key in an ascending run; -1 the last not
+// below it in a descending one.
+private match_position(s: Sheet, args: Buf[&Expr]) -> Result[Value, Fault]
+    val key = eval(s, args.at(0))
+
+    if key.is_error() then return Ok(key)
+
+    val a = range_arg(s, args.at(1))?
+    val kind = if args.len() == 3 then number_at(s, args, 2)?.trunc() else 1.0
+
+    if a.width() > 1 && a.height() > 1 then return Err(NotAvailable)
+
+    val cells = line_of(s, a, a.width() == 1)
+    val found = if kind == 0.0 then exact(s, key, cells) else approximate(s, key, cells, kind < 0.0)
+
+    found match
+        Some(i) -> Ok(Number(real(i + 1)))
+        None -> Err(NotAvailable)
+end match_position

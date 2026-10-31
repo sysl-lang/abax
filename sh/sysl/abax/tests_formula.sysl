@@ -1,0 +1,13 @@
+module sh.sysl.abax
+@tests
+
+// A formula read and written back.
+private round_trip(text: string) -> string
+    parse_formula(text) match
+        Ok(e) -> formula_text(e)
+        Err(m) -> "error: " + m
+
+@test("a formula reads and writes back")
+formula_round_trip()
+    assert_eq(round_trip("1+2*3"), "1+2*3")
+    assert_eq(round_trip("sum( a1 : b2 , $C$3 )"), "SUM(A1:B2,$C$3)")

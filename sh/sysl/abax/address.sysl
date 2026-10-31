@@ -1,0 +1,217 @@
+module sh.sysl.abax
+
+import sysl.text.{str_builder, to_upper}
+
+// Where a cell is, and the rectangles of cells a formula names.
+//
+// **Columns and rows are counted from zero inside the library** and from A and 1 on the screen. The
+// limits are Excel's: 16,384 columns, the last of them `XFD`, and 1,048,576 rows.
+
+val MAX_COLS = 16384
+val MAX_ROWS = 1048576
+
+// One end of a reference as a formula writes it: a column and a row, each of which may be pinned
+// with `$` so that copying the formula does not move it. A whole-row reference has no column (`-1`)
+// and a whole-column one has no row.
+struct Ref derives Eq
+    col: int
+    row: int
+    col_abs: bool
+    row_abs: bool
+
+    // The A1 text, `$` markers and all.
+    text(self) -> string
+        var sb = str_builder()
+
+        if self.col >= 0
+            if self.col_abs then sb.push("$")
+
+            sb.push(column_name(self.col))
+
+        if self.row >= 0
+            if self.row_abs then sb.push("$")
+
+            sb.push_int(self.row + 1)
+
+        sb.finish()
+    end text
+end Ref
+
+// A cell by position, with neither end pinned.
+at(col: int, row: int) -> Ref = Ref(col, row, false, false)
+
+// A rectangle of cells, both corners included, always with the smaller column and row first.
+struct Area derives Eq
+    col1: int
+    row1: int
+    col2: int
+    row2: int
+
+    contains(self, col: int, row: int) -> bool =
+        col >= self.col1 && col <= self.col2 && row >= self.row1 && row <= self.row2
+
+    width(self) -> int = self.col2 - self.col1 + 1
+
+    height(self) -> int = self.row2 - self.row1 + 1
+
+    // How many cells it covers, as a `long`: a whole sheet is seventeen billion.
+    size(self) -> long = long(self.width()) * long(self.height())
+
+    is_cell(self) -> bool = self.col1 == self.col2 && self.row1 == self.row2
+end Area
+
+// The area two ends of a range cover. A whole-column end spans every row, a whole-row end every
+// column.
+area_of(a: Ref, b: Ref) -> Area
+    val c1 = if a.col < 0 then 0 else a.col
+    val c2 = if b.col < 0 then MAX_COLS - 1 else b.col
+    val r1 = if a.row < 0 then 0 else a.row
+    val r2 = if b.row < 0 then MAX_ROWS - 1 else b.row
+
+    Area(c1.min(c2), r1.min(r2), c1.max(c2), r1.max(r2))
+end area_of
+
+// The area of one cell.
+cell_area(col: int, row: int) -> Area = Area(col, row, col, row)
+
+// The letters of a column: 0 is `A`, 25 `Z`, 26 `AA`, 16383 `XFD`.
+column_name(col: int) -> string
+    var letters: [3]u8 = [0, 0, 0]
+    var n = col + 1
+    var count = 0
+
+    while n > 0
+        val r = (n - 1) % 26
+
+        letters[count] = u8('A') + u8(r)
+        count += 1
+        n = (n - 1) / 26
+
+    var sb = str_builder()
+    var i = count
+
+    while i > 0
+        i -= 1
+        sb.push_char(char(u32(letters[i])))
+
+    sb.finish()
+end column_name
+
+// The column some letters name, in either case, if it is inside the sheet: `A` is 0, `XFD` 16383,
+// and `XFE` is nothing.
+column_index(letters: string) -> Option[int]
+    if letters.len == 0 || letters.len > 3 then return None
+
+    var n = 0
+
+    for c in letters.bytes
+        val u = c.to_upper()
+
+        if !u.is_upper() then return None
+
+        n = n * 26 + int(u - u8('A')) + 1
+
+    if n > MAX_COLS then None else Some(n - 1)
+end column_index
+
+// A single cell's A1 address, such as `B7` or `$B$7`, with nothing else around it. A range or a
+// sheet name is not one; `parse_formula` reads those.
+parse_ref(text: string) -> Option[Ref]
+    var r = read_ref(text.bytes, 0)
+
+    r match
+        Some(got) -> if got.1 == text.len && got.0.col >= 0 && got.0.row >= 0 then Some(got.0) else None
+        None -> None
+end parse_ref
+
+// A cell reference read at `from`: `$`, letters, `$`, digits -- or only the letters, or only the
+// digits, for one end of a whole-column or whole-row range. It answers the reference and where it
+// ended, or nothing if what stands there is not a reference inside the sheet's limits.
+read_ref(b: []const u8, from: usize) -> Option[(Ref, usize)]
+    var i = from
+    val col_abs = i < b.len && b[i] == u8('$')
+
+    if col_abs then i += 1
+
+    val l0 = i
+
+    while i < b.len && b[i].is_alpha()
+        i += 1
+
+    val letters = i - l0
+    var col = -1
+
+    if letters > 0
+        col = column_index(from_bytes(b[l0..<i])) match
+            Some(c) -> c
+            None -> return None
+    elif col_abs
+        // A `$` then digits is a pinned row of a whole-row range, not a column.
+        i = from
+
+    val row_abs = i < b.len && b[i] == u8('$')
+
+    if row_abs then i += 1
+
+    val d0 = i
+    var row: long = 0
+
+    while i < b.len && b[i].is_digit()
+        row = row * 10 + long(b[i] - u8('0'))
+        i += 1
+
+        if row > long(MAX_ROWS) then return None
+
+    val digits = i - d0
+    var r = -1
+
+    if digits > 0
+        if row == 0 then return None
+
+        r = int(row) - 1
+    elif row_abs
+        return None
+
+    if letters == 0 && digits == 0 then return None
+
+    Some((Ref(col, r, col_abs && letters > 0, row_abs), i))
+end read_ref
+
+// Bytes known to be ASCII letters, as a string.
+private from_bytes(b: []const u8) -> string
+    var sb = str_builder()
+
+    for c in b
+        sb.push_char(char(u32(c)))
+
+    sb.finish()
+end from_bytes
+
+// A sheet name as a formula writes it: bare where it is a plain word, in single quotes with any quote
+// doubled where it is not.
+sheet_prefix(name: string) -> string
+    if name.len == 0 then return ""
+
+    var plain = !name.bytes[0].is_digit()
+
+    for c in name.bytes
+        if !(c.is_alnum() || c == u8('_') || c == u8('.')) then plain = false
+
+    // A name that reads as a cell address would be one.
+    if plain && parse_ref(name).is_some() then plain = false
+
+    if plain then return name + "!"
+
+    var sb = str_builder()
+
+    sb.push("'")
+
+    for ch in name.chars
+        if ch == '\'' then sb.push("''") else sb.push_char(ch)
+
+    sb.push("'!")
+    sb.finish()
+end sheet_prefix
+
+// Two sheet names are the same sheet when they differ only in case, as Excel has it.
+same_sheet(a: string, b: string) -> bool = to_upper(a) == to_upper(b)

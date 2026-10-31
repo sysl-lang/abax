@@ -1,0 +1,295 @@
+module sh.sysl.abax
+
+import sysl.buf.byte_sink
+import sysl.fmt.format_real
+import sysl.text.{from_utf8_unchecked, parse_real, to_upper}
+
+// What a cell holds once it has been worked out, and the rules for turning one kind into another.
+//
+// **A spreadsheet is dynamically typed**: the same cell may hold a number today and text tomorrow, and
+// every operator decides what to do from what it is handed. `Value` is that one type, and the
+// coercions below are Excel's, since those are the rules every spreadsheet user has learned.
+
+// The errors every spreadsheet program agrees on, plus the one a circular reference gives.
+enum Fault
+    // `#DIV/0!`: a division by zero, or an average of nothing.
+    DivByZero
+    // `#VALUE!`: an operand of the wrong kind, such as text that does not read as a number.
+    WrongType
+    // `#REF!`: a reference to a cell or a sheet that is not there.
+    BadRef
+    // `#NAME?`: a function or a name nobody defined.
+    BadName
+    // `#N/A`: a lookup that found nothing.
+    NotAvailable
+    // `#NUM!`: a number out of range, or an answer that is not one.
+    BadNumber
+    // `#NULL!`: an intersection of two ranges that do not meet.
+    NullRange
+    // A formula that depends on itself, directly or around a loop.
+    Circular
+
+    // The text a cell shows for it, which is also how it is typed into a formula.
+    text(self) -> string = self match
+        DivByZero -> "#DIV/0!"
+        WrongType -> "#VALUE!"
+        BadRef -> "#REF!"
+        BadName -> "#NAME?"
+        NotAvailable -> "#N/A"
+        BadNumber -> "#NUM!"
+        NullRange -> "#NULL!"
+        Circular -> "#CIRC!"
+end Fault
+
+// The fault an error literal names, ignoring case; `#CIRC!` is not one, since nobody types it.
+fault_named(text: string) -> Option[Fault]
+    val t = to_upper(text)
+
+    if t == "#DIV/0!" then return Some(DivByZero)
+    if t == "#VALUE!" then return Some(WrongType)
+    if t == "#REF!" then return Some(BadRef)
+    if t == "#NAME?" then return Some(BadName)
+    if t == "#N/A" then return Some(NotAvailable)
+    if t == "#NUM!" then return Some(BadNumber)
+    if t == "#NULL!" then return Some(NullRange)
+
+    None
+end fault_named
+
+// One cell's worth of meaning.
+enum Value derives Eq
+    // Nothing there: reads as 0 to arithmetic, "" to text and FALSE to logic.
+    Empty
+    Number(x: real)
+    Text(s: string)
+    Bool(b: bool)
+    Error(f: Fault)
+
+    is_error(self) -> bool = self match
+        Error(_) -> true
+        _ -> false
+
+    // What the cell shows: numbers in General format, booleans in capitals, errors as their code.
+    display(self) -> string = self match
+        Empty -> ""
+        Number(x) -> general(x)
+        Text(s) -> s
+        Bool(b) -> if b then "TRUE" else "FALSE"
+        Error(f) -> f.text()
+end Value
+
+// --- Coercion -----------------------------------------------------------------------------------------
+
+// The number a value is to arithmetic: an empty cell is 0, TRUE is 1, text is a number if it reads as
+// one, and an error stays itself.
+to_number(v: Value) -> Result[real, Fault]
+    v match
+        Empty -> Ok(0.0)
+        Number(x) -> Ok(x)
+        Bool(b) -> Ok(if b then 1.0 else 0.0)
+        Text(s) ->
+            number_of(s) match
+                Some(x) -> Ok(x)
+                None -> Err(WrongType)
+        Error(f) -> Err(f)
+end to_number
+
+// The text a value is to `&` and the text functions. A number is written with up to fifteen
+// significant digits, which is what Excel's concatenation writes.
+to_text(v: Value) -> Result[string, Fault]
+    v match
+        Empty -> Ok("")
+        Number(x) -> Ok(number_text(x))
+        Text(s) -> Ok(s)
+        Bool(b) -> Ok(if b then "TRUE" else "FALSE")
+        Error(f) -> Err(f)
+end to_text
+
+// The truth a value is to `IF`, `AND` and the rest: a number is TRUE when it is not zero, and only the
+// words TRUE and FALSE read as text.
+to_bool(v: Value) -> Result[bool, Fault]
+    v match
+        Empty -> Ok(false)
+        Number(x) -> Ok(x != 0.0)
+        Bool(b) -> Ok(b)
+        Text(s) ->
+            val t = to_upper(s)
+
+            if t == "TRUE" then Ok(true) elif t == "FALSE" then Ok(false) else Err(WrongType)
+        Error(f) -> Err(f)
+end to_bool
+
+// The number some text reads as, the way typing into a cell reads one: spaces around it, a sign,
+// digits with an optional point, an optional exponent and an optional trailing `%`. Anything else --
+// `inf`, `0x10`, a stray letter -- is not a number, however a C reader might take it.
+number_of(text: string) -> Option[real]
+    val b = text.bytes
+    var lo: usize = 0
+    var hi = b.len
+
+    while lo < hi && b[lo] == u8(' ')
+        lo += 1
+
+    while hi > lo && b[hi - 1] == u8(' ')
+        hi -= 1
+
+    var percent = false
+
+    if hi > lo && b[hi - 1] == u8('%')
+        percent = true
+        hi -= 1
+
+    if !is_decimal(b[lo..<hi]) then return None
+
+    parse_real(b[lo..<hi]) match
+        Ok(x) -> Some(if percent then x / 100.0 else x)
+        Err(_) -> None
+end number_of
+
+// Whether bytes are a decimal number and nothing else: `[+-] digits [. digits] [e [+-] digits]`, with
+// at least one digit before the exponent.
+private is_decimal(b: []const u8) -> bool
+    var i: usize = 0
+
+    if i < b.len && (b[i] == u8('+') || b[i] == u8('-')) then i += 1
+
+    var digits = 0
+
+    while i < b.len && b[i].is_digit()
+        i += 1
+        digits += 1
+
+    if i < b.len && b[i] == u8('.')
+        i += 1
+
+        while i < b.len && b[i].is_digit()
+            i += 1
+            digits += 1
+
+    if digits == 0 then return false
+
+    if i < b.len && (b[i] == u8('e') || b[i] == u8('E'))
+        i += 1
+
+        if i < b.len && (b[i] == u8('+') || b[i] == u8('-')) then i += 1
+
+        var exp = 0
+
+        while i < b.len && b[i].is_digit()
+            i += 1
+            exp += 1
+
+        if exp == 0 then return false
+
+    i == b.len
+end is_decimal
+
+// --- Writing numbers --------------------------------------------------------------------------------
+
+// A number as General format shows it in a standard-width cell: the text fits in eleven characters
+// (a sign aside), so an integer of up to eleven digits is written whole, a fraction is rounded to fit
+// (`1/3` is `0.333333333`), and anything that cannot fit -- from 1E+11 up, or below 1E-09 -- is
+// written in scientific form with as many mantissa digits as fit (`1.23457E+11`).
+general(x: real) -> string
+    if x.is_nan() then return "#NUM!"
+    if x == 0.0 then return "0"
+
+    val sign = if x < 0.0 then "-" else ""
+    val m = x.abs()
+
+    if !m.is_finite() then return "#NUM!"
+
+    val e = exponent_of(m)
+
+    if e >= -9 && e <= 10
+        val places = if e >= 0 then 9 - e else 9
+        val fixed = trim_fraction(format_real(m, "%.*f", 0, if places < 0 then 0 else places))
+
+        // Rounding may carry into a twelfth digit (99999999999.5), and then it no longer fits.
+        if fixed.len <= 11 && fixed != "0" then return sign + fixed
+
+    sign + scientific(m)
+end general
+
+// The decimal exponent of a positive finite number, as `%e` writes it after rounding to eleven
+// significant digits.
+private exponent_of(m: real) -> int
+    val t = format_real(m, "%.*e", 0, 10)
+    var i = t.bytes.len - 1
+
+    while t.bytes[i] != u8('e')
+        i -= 1
+
+    int_after(t, i + 1)
+end exponent_of
+
+// The integer written after position `from`, with its sign.
+private int_after(t: string, from: usize) -> int
+    var i = from
+    var neg = false
+
+    if t.bytes[i] == u8('-')
+        neg = true
+        i += 1
+    elif t.bytes[i] == u8('+')
+        i += 1
+
+    var n = 0
+
+    while i < t.bytes.len
+        n = n * 10 + int(t.bytes[i] - u8('0'))
+        i += 1
+
+    if neg then -n else n
+end int_after
+
+// Scientific form in eleven characters: `1.23457E+11`, `1E-10`, `1.2346E+100`.
+private scientific(m: real) -> string
+    val e = exponent_of(m)
+    val digits = if e >= 100 || e <= -100 then 4 else 5
+    val t = format_real(m, "%.*e", 0, digits)
+    var at: usize = 0
+
+    while t.bytes[at] != u8('e')
+        at += 1
+
+    val mantissa = trim_fraction(t[0..<at])
+    val ex = int_after(t, at + 1)
+    val mag = if ex < 0 then -ex else ex
+    val pad = if mag < 10 then "0" else ""
+
+    mantissa + (if ex < 0 then "E-" else "E+") + pad + mag.to_string()
+end scientific
+
+// Trailing zeros after a decimal point dropped, and the point too if nothing is left after it.
+private trim_fraction(t: string) -> string
+    if !t.contains(".") then return t
+
+    var hi = t.len
+
+    while t.bytes[hi - 1] == u8('0')
+        hi -= 1
+
+    if t.bytes[hi - 1] == u8('.') then hi -= 1
+
+    t[0..<hi]
+end trim_fraction
+
+// A number as text for `&` and the text functions: up to fifteen significant digits, Excel's
+// precision, so `0.1 + 0.2` is `0.3`, with an upper-case exponent where one is needed.
+number_text(x: real) -> string
+    if !x.is_finite() then return "#NUM!"
+
+    val t = format_real(x, "%.*g", 0, 15)
+
+    if t.contains("e") then to_upper(t) else t
+end number_text
+
+// The shortest text that reads back as exactly this `real`, which is what a file stores: `0.1`, not
+// `0.10000000000000001`; `1e+300`, not three hundred digits.
+shortest_text(x: real) -> string
+    var sink = byte_sink()
+
+    display_real_shortest(x, &sink, FormatSpec(0, -1, false))
+    from_utf8_unchecked(sink.text())
+end shortest_text

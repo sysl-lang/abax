@@ -1,0 +1,628 @@
+module sh.sysl.abax
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{str_builder, to_upper}
+import sh.sysl.parsing.{pratt, Span, Spanned, Tokens, tokens, TokenStream}
+
+// Formulas: the text after the `=`, read into a tree, and the tree written back as text.
+//
+// **The reader is in two tiers**: a lexer that turns the text into tokens -- where a reference, a
+// range and a sheet name are each read whole, since `A1:B2` and `Sheet2!A1` are single things to
+// anyone who reads a formula -- and a Pratt loop over those tokens for the operators.
+
+// --- The tree -----------------------------------------------------------------------------------------
+
+// The operators that stand between two operands.
+enum BinOp
+    Add
+    Sub
+    Mul
+    Div
+    Pow
+    Concat
+    Equal
+    NotEqual
+    Less
+    Greater
+    LessEqual
+    GreaterEqual
+
+    // The operator as a formula writes it.
+    text(self) -> string = self match
+        Add -> "+"
+        Sub -> "-"
+        Mul -> "*"
+        Div -> "/"
+        Pow -> "^"
+        Concat -> "&"
+        Equal -> "="
+        NotEqual -> "<>"
+        Less -> "<"
+        Greater -> ">"
+        LessEqual -> "<="
+        GreaterEqual -> ">="
+end BinOp
+
+// A formula, parsed. A sheet name of "" means the sheet the formula is on.
+enum Expr
+    // A number, a string, TRUE or FALSE, or an error typed as a literal.
+    Literal(v: Value)
+    CellRef(sheet: string, r: Ref)
+    RangeRef(sheet: string, a: Ref, b: Ref)
+    // A word that is neither a function call nor a reference; it evaluates to `#NAME?`.
+    Name(s: string)
+    Negate(e: &Expr)
+    Posit(e: &Expr)
+    PercentOf(e: &Expr)
+    Binary(op: BinOp, a: &Expr, b: &Expr)
+    // A function call; the name is upper case, whatever was typed.
+    Call(name: string, args: Buf[&Expr])
+    // Parentheses the author wrote, kept so the formula is written back as it was typed.
+    Group(e: &Expr)
+    // An argument left empty, as the second in `IF(A1,,2)`.
+    Missing
+end Expr
+
+// --- Tokens ------------------------------------------------------------------------------------------
+
+// A token. An operator is its character, with `<=`, `>=` and `<>` as `l`, `g` and `n`.
+private enum Tok
+    TNum(x: real)
+    TStr(s: string)
+    TBool(b: bool)
+    TErr(f: Fault)
+    TRef(sheet: string, r: Ref)
+    TRange(sheet: string, a: Ref, b: Ref)
+    TName(s: string)
+    TOp(c: u8)
+    TOpen
+    TClose
+    TComma
+end Tok
+
+// A byte that may continue a name, so a reference followed by one is not a reference (`A1B`).
+private is_name_byte(c: u8) -> bool = c.is_alnum() || c == u8('_') || c == u8('.')
+
+// The text of a formula as tokens, or what was wrong with it.
+private lex(text: string) -> Result[Tokens[Tok], string]
+    val b = text.bytes
+    var out: Tokens[Tok] = tokens()
+    var i: usize = 0
+
+    while i < b.len
+        val c = b[i]
+        val start = i
+
+        if c == u8(' ') || c == u8('\t') || c == u8('\n') || c == u8('\r')
+            i += 1
+            continue
+
+        val point = c == u8('.') && i + 1 < b.len && b[i + 1].is_digit()
+
+        if c.is_digit() || point || c == u8('$') || c.is_alpha() || c == u8('_')
+            // A reference first: `A1`, `$B$2:C3`, `A:C`, `3:5`.
+            read_area(b, i) match
+                Some(got) ->
+                    out.push(area_token("", got.0, got.1), Span(start, got.2))
+                    i = got.2
+                    continue
+                None -> ()
+
+            if c.is_digit() || c == u8('.')
+                val n = number_end(b, i)
+
+                if n < b.len && is_name_byte(b[n]) then return Err(s"'${text[i..<word_end(b, n)]}' is not a number")
+
+                number_of(text[i..<n]) match
+                    Some(x) -> out.push(TNum(x), Span(start, n))
+                    None -> return Err(s"'${text[i..<n]}' is not a number")
+
+                i = n
+                continue
+
+            if c == u8('$') then return Err(s"'$$' must be followed by a reference, at ${i + 1}")
+
+            val w = word_end(b, i)
+            val word = text[i..<w]
+
+            if w < b.len && b[w] == u8('!')
+                i = sheet_ref(b, w + 1, word, &out, start)?
+                continue
+
+            val upper = to_upper(word)
+            val call = next_byte(b, w) == Some(u8('('))
+
+            if !call && (upper == "TRUE" || upper == "FALSE")
+                out.push(TBool(upper == "TRUE"), Span(start, w))
+            else
+                out.push(TName(word), Span(start, w))
+
+            i = w
+        elif c == u8('"')
+            var sb = str_builder()
+            var j = i + 1
+            var closed = false
+
+            while j < b.len
+                if b[j] == u8('"')
+                    if j + 1 < b.len && b[j + 1] == u8('"')
+                        sb.push("\"")
+                        j += 2
+                        continue
+
+                    closed = true
+                    j += 1
+                    break
+
+                // Copy a whole character at a time, so the text stays valid.
+                var k = j + 1
+
+                while k < b.len && (b[k] & 0xC0) == 0x80
+                    k += 1
+
+                sb.push(text[j..<k])
+                j = k
+
+            if !closed then return Err("a string is not closed")
+
+            out.push(TStr(sb.finish()), Span(start, j))
+            i = j
+        elif c == u8('\'')
+            // A quoted sheet name: `'My sheet'!A1`, with `''` for a quote inside it.
+            var sb = str_builder()
+            var j = i + 1
+            var closed = false
+
+            while j < b.len
+                if b[j] == u8('\'')
+                    if j + 1 < b.len && b[j + 1] == u8('\'')
+                        sb.push("'")
+                        j += 2
+                        continue
+
+                    closed = true
+                    j += 1
+                    break
+
+                var k = j + 1
+
+                while k < b.len && (b[k] & 0xC0) == 0x80
+                    k += 1
+
+                sb.push(text[j..<k])
+                j = k
+
+            if !closed then return Err("a quoted sheet name is not closed")
+            if j >= b.len || b[j] != u8('!') then return Err("a quoted sheet name must be followed by '!'")
+
+            i = sheet_ref(b, j + 1, sb.finish(), &out, start)?
+        elif c == u8('#')
+            val e = error_end(b, i)
+
+            if e == i then return Err(s"'${text[i..<word_end(b, i + 1)]}' is not an error value")
+
+            out.push(TErr(fault_named(text[i..<e]).unwrap()), Span(start, e))
+            i = e
+        elif c == u8('<')
+            if next_byte(b, i + 1) == Some(u8('='))
+                out.push(TOp(u8('l')), Span(start, i + 2))
+                i += 2
+            elif next_byte(b, i + 1) == Some(u8('>'))
+                out.push(TOp(u8('n')), Span(start, i + 2))
+                i += 2
+            else
+                out.push(TOp(c), Span(start, i + 1))
+                i += 1
+        elif c == u8('>')
+            if next_byte(b, i + 1) == Some(u8('='))
+                out.push(TOp(u8('g')), Span(start, i + 2))
+                i += 2
+            else
+                out.push(TOp(c), Span(start, i + 1))
+                i += 1
+        elif c == u8('(')
+            out.push(TOpen, Span(start, i + 1))
+            i += 1
+        elif c == u8(')')
+            out.push(TClose, Span(start, i + 1))
+            i += 1
+        elif c == u8(',')
+            out.push(TComma, Span(start, i + 1))
+            i += 1
+        elif is_operator_byte(c)
+            out.push(TOp(c), Span(start, i + 1))
+            i += 1
+        else
+            return Err(s"'${text[i..<char_end(b, i)]}' is not part of a formula, at ${i + 1}")
+
+    Ok(out)
+end lex
+
+// The reference after a sheet name's `!`, pushed as one token; the answer is where it ended.
+private sheet_ref(b: []const u8, from: usize, sheet: string, out: *Tokens[Tok], start: usize) -> Result[usize, string]
+    read_area(b, from) match
+        Some(got) ->
+            out.push(area_token(sheet, got.0, got.1), Span(start, got.2))
+            Ok(got.2)
+        None -> Err(s"'${sheet}!' must be followed by a reference")
+end sheet_ref
+
+private area_token(sheet: string, a: Ref, b: Option[Ref]) -> Tok
+    b match
+        Some(e) -> TRange(sheet, a, e)
+        None -> TRef(sheet, a)
+
+// A reference at `from` -- a cell, a range of cells, a range of whole columns or of whole rows --
+// that is not the start of a longer word or a function call: its first end, its second if it is a
+// range, and where it stopped.
+private read_area(b: []const u8, from: usize) -> Option[(Ref, Option[Ref], usize)]
+    val first = read_ref(b, from)?
+    val a = first.0
+    val full = a.col >= 0 && a.row >= 0
+    var end = first.1
+    var second: Option[Ref] = None
+
+    if end < b.len && b[end] == u8(':')
+        read_ref(b, end + 1) match
+            Some(got) ->
+                val e = got.0
+                val same_shape = (e.col >= 0) == (a.col >= 0) && (e.row >= 0) == (a.row >= 0)
+
+                if same_shape
+                    second = Some(e)
+                    end = got.1
+            None -> ()
+
+    // A whole column or a whole row means something only as a range.
+    if !full && second.is_none() then return None
+
+    if end < b.len && (is_name_byte(b[end]) || b[end] == u8('(') || b[end] == u8('!')) then return None
+
+    Some((a, second, end))
+end read_area
+
+// Where a decimal number starting at `i` ends: digits, a point, digits, an exponent.
+private number_end(b: []const u8, from: usize) -> usize
+    var i = from
+
+    while i < b.len && b[i].is_digit()
+        i += 1
+
+    if i < b.len && b[i] == u8('.')
+        i += 1
+
+        while i < b.len && b[i].is_digit()
+            i += 1
+
+    if i < b.len && (b[i] == u8('e') || b[i] == u8('E'))
+        var j = i + 1
+
+        if j < b.len && (b[j] == u8('+') || b[j] == u8('-')) then j += 1
+
+        if j < b.len && b[j].is_digit()
+            while j < b.len && b[j].is_digit()
+                j += 1
+
+            i = j
+
+    i
+end number_end
+
+// Where a run of name bytes starting at `i` ends.
+private word_end(b: []const u8, from: usize) -> usize
+    var i = from
+
+    while i < b.len && is_name_byte(b[i])
+        i += 1
+
+    i
+end word_end
+
+// Where the character starting at `i` ends.
+private char_end(b: []const u8, from: usize) -> usize
+    var i = from + 1
+
+    while i < b.len && (b[i] & 0xC0) == 0x80
+        i += 1
+
+    i
+end char_end
+
+private is_operator_byte(c: u8) -> bool = "+-*/^&%=:".has_byte(c)
+
+private next_byte(b: []const u8, i: usize) -> Option[u8] = if i < b.len then Some(b[i]) else None
+
+// Where an error literal at `#` ends, or `from` itself if none is there.
+private error_end(b: []const u8, from: usize) -> usize
+    for name in ["#DIV/0!", "#VALUE!", "#REF!", "#NAME?", "#N/A", "#NUM!", "#NULL!"]
+        val n = name.len
+
+        if from + n <= b.len
+            var same = true
+
+            for k in 0..<n
+                if b[from + k].to_upper() != name.bytes[k] then same = false
+
+            if same then return from + n
+
+    from
+end error_end
+
+// --- The parser ------------------------------------------------------------------------------------
+
+// The parser is the token stream the Pratt loop reads, so every callback reaches the first problem
+// found and the nesting depth through it.
+private struct Parser
+    toks: Tokens[Tok]
+    problem: string
+    depth: int
+
+impl TokenStream for Parser
+    type Token = Spanned[Tok]
+
+    look(self) -> Option[Spanned[Tok]] = self.toks.peek()
+
+    take(*self) -> Option[Spanned[Tok]] = self.toks.advance()
+
+// How deeply a formula may nest before it is refused rather than read.
+val MAX_DEPTH = 200
+
+// Binding powers, loosest first. Excel puts negation above `^`, so `-2^2` is 4.
+val BP_COMPARE: u16 = 10
+val BP_CONCAT: u16 = 20
+val BP_ADD: u16 = 30
+val BP_MUL: u16 = 40
+val BP_POW: u16 = 50
+val BP_PERCENT: u16 = 60
+val BP_PREFIX: u16 = 65
+val BP_RANGE: u16 = 70
+
+// A formula, the text after its `=`, as a tree -- or the first thing wrong with it.
+parse_formula(text: string) -> Result[Expr, string]
+    var p = Parser(lex(text)?, "", 0)
+
+    if p.toks.len() == 0 then return Err("the formula is empty")
+
+    val e = expr(&p, 0)
+
+    if p.problem.len == 0
+        p.toks.peek() match
+            Some(t) -> p.fail(s"${describe(t.value)} was not expected, at ${t.span.start + 1}")
+            None -> ()
+
+    if p.problem.len > 0 then Err(p.problem) else Ok(*e)
+end parse_formula
+
+impl Parser
+    // The first problem is the one reported; the rest follow from it.
+    fail(*self, message: string)
+        if self.problem.len == 0 then self.problem = message
+
+private expr(p: *Parser, min_bp: u16) -> &Expr
+    pratt(p, min_bp, nud, led, lbp) match
+        Some(e) -> e
+        None ->
+            p.fail("the formula ends where an operand was expected")
+            Missing
+end expr
+
+private lbp(t: Spanned[Tok]) -> u16
+    t.value match
+        TOp(c) ->
+            if c == u8('+') || c == u8('-') then BP_ADD
+            elif c == u8('*') || c == u8('/') then BP_MUL
+            elif c == u8('^') then BP_POW
+            elif c == u8('&') then BP_CONCAT
+            elif c == u8('%') then BP_PERCENT
+            elif c == u8(':') then BP_RANGE
+            else BP_COMPARE
+        _ -> 0
+end lbp
+
+private nud(t: Spanned[Tok], p: *Parser) -> &Expr
+    if p.depth >= MAX_DEPTH
+        p.fail("the formula nests too deeply")
+        return Missing
+
+    p.depth += 1
+
+    val out = nud_at(t, p)
+
+    p.depth -= 1
+    out
+end nud
+
+private nud_at(t: Spanned[Tok], p: *Parser) -> &Expr
+    t.value match
+        TNum(x) -> Literal(Number(x))
+        TStr(s) -> Literal(Text(s))
+        TBool(b) -> Literal(Bool(b))
+        TErr(f) -> Literal(Error(f))
+        TRef(sheet, r) -> CellRef(sheet, r)
+        TRange(sheet, a, b) -> RangeRef(sheet, a, b)
+        TOp(c) ->
+            if c == u8('-')
+                Negate(expr(p, BP_PREFIX))
+            elif c == u8('+')
+                Posit(expr(p, BP_PREFIX))
+            else
+                p.fail(s"${describe(t.value)} was not expected, at ${t.span.start + 1}")
+                Missing
+        TOpen ->
+            val inner = expr(p, 0)
+
+            if !p.toks.accept_if(is_close).is_some() then p.fail(s"a ')' is missing for the '(' at ${t.span.start + 1}")
+
+            Group(inner)
+        TName(n) ->
+            if p.toks.accept_if(is_open).is_some() then Call(to_upper(n), arguments(p, t)) else Name(n)
+        _ ->
+            p.fail(s"${describe(t.value)} was not expected, at ${t.span.start + 1}")
+            Missing
+end nud_at
+
+// A call's arguments, after its `(`; an empty one is `Missing`.
+private arguments(p: *Parser, name: Spanned[Tok]) -> Buf[&Expr]
+    var args: Buf[&Expr] = buf()
+
+    if p.toks.accept_if(is_close).is_some() then return args
+
+    loop
+        val ahead = p.toks.peek()
+        val empty = ahead match
+            Some(n) -> is_comma(n.value) || is_close(n.value)
+            None -> false
+
+        args.push(if empty then Missing else expr(p, 0))
+
+        if p.toks.accept_if(is_comma).is_some() then continue
+        if p.toks.accept_if(is_close).is_some() then break
+
+        p.fail(s"a ')' is missing for the call at ${name.span.start + 1}")
+        break
+
+    args
+end arguments
+
+private led(left: &Expr, t: Spanned[Tok], p: *Parser) -> &Expr
+    t.value match
+        TOp(c) ->
+            if c == u8('%') then return PercentOf(left)
+            if c == u8(':') then return range_of(left, expr(p, BP_RANGE), t, p)
+
+            // Every operator groups to the left, `^` included, as Excel has it: `2^3^2` is 64.
+            Binary(binop_of(c), left, expr(p, lbp(t)))
+        _ -> left
+end led
+
+// `a : b` written with spaces, or with the two ends read apart: two cell references on one sheet
+// make the range between them, and anything else is refused.
+private range_of(left: &Expr, right: &Expr, t: Spanned[Tok], p: *Parser) -> &Expr
+    *left match
+        CellRef(s1, a) ->
+            *right match
+                CellRef(s2, b) -> if s2.len == 0 || same_sheet(s1, s2) then return RangeRef(s1, a, b)
+                _ -> ()
+        _ -> ()
+
+    p.fail(s"':' needs a cell reference on each side, at ${t.span.start + 1}")
+    Missing
+end range_of
+
+private binop_of(c: u8) -> BinOp
+    if c == u8('+') then return Add
+    if c == u8('-') then return Sub
+    if c == u8('*') then return Mul
+    if c == u8('/') then return Div
+    if c == u8('^') then return Pow
+    if c == u8('&') then return Concat
+    if c == u8('=') then return Equal
+    if c == u8('n') then return NotEqual
+    if c == u8('<') then return Less
+    if c == u8('>') then return Greater
+    if c == u8('l') then return LessEqual
+
+    GreaterEqual
+end binop_of
+
+private is_open(t: Tok) -> bool = t match
+    TOpen -> true
+    _ -> false
+
+private is_close(t: Tok) -> bool = t match
+    TClose -> true
+    _ -> false
+
+private is_comma(t: Tok) -> bool = t match
+    TComma -> true
+    _ -> false
+
+// A token as a message names it.
+private describe(t: Tok) -> string
+    t match
+        TNum(x) -> s"'${number_text(x)}'"
+        TStr(_) -> "a string"
+        TBool(b) -> if b then "'TRUE'" else "'FALSE'"
+        TErr(f) -> s"'${f.text()}'"
+        TRef(sheet, r) -> s"'${sheet_prefix(sheet)}${r.text()}'"
+        TRange(sheet, a, b) -> s"'${sheet_prefix(sheet)}${a.text()}:${b.text()}'"
+        TName(n) -> s"'$n'"
+        TOp(c) ->
+            if c == u8('l') then "'<='"
+            elif c == u8('g') then "'>='"
+            elif c == u8('n') then "'<>'"
+            else s"'${char(u32(c))}'"
+        TOpen -> "'('"
+        TClose -> "')'"
+        TComma -> "','"
+end describe
+
+// --- Writing a formula back -------------------------------------------------------------------------
+
+// A formula tree as text, without its `=`: names in upper case, no spaces, numbers in their shortest
+// form, and the parentheses that were typed. Reading the text back gives the same tree.
+formula_text(e: &Expr) -> string
+    *e match
+        Literal(v) ->
+            v match
+                Number(x) -> shortest_text(x)
+                Text(s) ->
+                    var sb = str_builder()
+
+                    sb.push("\"")
+
+                    for ch in s.chars
+                        if ch == '"' then sb.push("\"\"") else sb.push_char(ch)
+
+                    sb.push("\"")
+                    sb.finish()
+                _ -> v.display()
+        CellRef(sheet, r) -> sheet_prefix(sheet) + r.text()
+        RangeRef(sheet, a, b) -> sheet_prefix(sheet) + a.text() + ":" + b.text()
+        Name(n) -> n
+        Negate(x) -> "-" + formula_text(x)
+        Posit(x) -> "+" + formula_text(x)
+        PercentOf(x) -> formula_text(x) + "%"
+        Binary(op, a, b) -> formula_text(a) + op.text() + formula_text(b)
+        Call(name, args) ->
+            var sb = str_builder()
+
+            sb.push(name)
+            sb.push("(")
+
+            for i in 0..<args.len()
+                if i > 0 then sb.push(",")
+
+                sb.push(formula_text(args.at(i)))
+
+            sb.push(")")
+            sb.finish()
+        Group(x) -> "(" + formula_text(x) + ")"
+        Missing -> ""
+end formula_text
+
+// Every area on the sheet called `sheet` that a formula reads, which is what its cell depends on. A
+// reference with no sheet name is to that sheet; one naming another sheet is not on it.
+precedents(e: &Expr, sheet: string) -> Buf[Area]
+    var out: Buf[Area] = buf()
+
+    collect(e, sheet, &out)
+    out
+end precedents
+
+private collect(e: &Expr, sheet: string, out: *Buf[Area])
+    *e match
+        CellRef(name, r) -> if name.len == 0 || same_sheet(name, sheet) then out.push(area_of(r, r))
+        RangeRef(name, a, b) -> if name.len == 0 || same_sheet(name, sheet) then out.push(area_of(a, b))
+        Negate(x) -> collect(x, sheet, out)
+        Posit(x) -> collect(x, sheet, out)
+        PercentOf(x) -> collect(x, sheet, out)
+        Group(x) -> collect(x, sheet, out)
+        Binary(_, a, b) ->
+            collect(a, sheet, out)
+            collect(b, sheet, out)
+        Call(_, args) ->
+            for i in 0..<args.len()
+                collect(args.at(i), sheet, out)
+        _ -> ()
+end collect
