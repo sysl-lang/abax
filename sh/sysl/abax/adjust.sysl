@@ -1,0 +1,150 @@
+module sh.sysl.abax
+
+import sysl.buf.{Buf, buf}
+
+// How the references in a formula follow an edit of the sheet, by Excel's rules.
+//
+// - **Copied**: a formula pasted somewhere else moves its relative parts by the distance it moved and
+//   keeps its `$` parts, so `=A1+$B$1` copied one row down is `=A2+$B$1`.
+// - **Inserted, deleted**: rows or columns opening or closing move every reference past them, `$` or
+//   not, since the cell it named has moved. A range grows when rows are inserted inside it and shrinks
+//   when some of its rows are deleted.
+// - **Moved**: cells cut and pasted take the references to them along -- every formula that read them
+//   reads them where they now are.
+//
+// **A reference with nowhere left to point becomes `#REF!`** in the formula, as a literal, the way
+// Excel writes it: copied off the edge of the sheet, deleted, or naming a cell a move wrote over. A
+// range losing only some of its rows does not: it shrinks. One losing all of them does.
+
+enum Adjust
+    // The formula itself copied `dc` columns and `dr` rows away.
+    Copied(dc: int, dr: int)
+    // `n` rows (or columns) inserted before row (column) `at`.
+    Inserted(rows: bool, at: int, n: int)
+    // Rows (or columns) `at` to `at + n - 1` deleted.
+    Deleted(rows: bool, at: int, n: int)
+    // The cells of `from` moved `dc` columns and `dr` rows.
+    Moved(from: Area, dc: int, dr: int)
+
+// A formula with its references adjusted. `sheet` is the name of the sheet the edit is on: a copy moves
+// every relative reference, wherever it points, while the other edits move only those to that sheet.
+adjust(e: &Expr, sheet: string, how: Adjust) -> &Expr
+    *e match
+        CellRef(s, r) ->
+            if !reaches(s, sheet, how) then return e
+
+            ends(r, r, how) match
+                Some((a, _)) -> CellRef(s, a)
+                None -> Literal(Error(BadRef))
+        RangeRef(s, a, b) ->
+            if !reaches(s, sheet, how) then return e
+
+            ends(a, b, how) match
+                Some((x, y)) -> RangeRef(s, x, y)
+                None -> Literal(Error(BadRef))
+        Negate(x) -> Negate(adjust(x, sheet, how))
+        Posit(x) -> Posit(adjust(x, sheet, how))
+        PercentOf(x) -> PercentOf(adjust(x, sheet, how))
+        Group(x) -> Group(adjust(x, sheet, how))
+        Binary(op, a, b) -> Binary(op, adjust(a, sheet, how), adjust(b, sheet, how))
+        Call(name, args) ->
+            var out: Buf[&Expr] = buf()
+
+            for i in 0..<args.len()
+                out.push(adjust(args.at(i), sheet, how))
+
+            Call(name, out)
+        _ -> e
+end adjust
+
+// A formula's text, with its `=`, after an edit; a constant's input is left as it was typed.
+adjust_input(input: string, sheet: string, how: Adjust) -> string
+    read_input(input) match
+        Ok(Formula(e)) -> "=" + formula_text(adjust(e, sheet, how))
+        _ -> input
+
+private reaches(name: string, sheet: string, how: Adjust) -> bool
+    how match
+        Copied(_, _) -> true
+        _ -> name.len == 0 || same_sheet(name, sheet)
+
+// The two ends of a reference -- the same one twice for a single cell -- after the edit, or nothing.
+private ends(a: Ref, b: Ref, how: Adjust) -> Option[(Ref, Ref)]
+    how match
+        Copied(dc, dr) -> Some((copied(a, dc, dr)?, copied(b, dc, dr)?))
+        Inserted(rows, at, n) -> along(a, b, rows, at, n, true)
+        Deleted(rows, at, n) -> along(a, b, rows, at, n, false)
+        Moved(from, dc, dr) ->
+            val there = area_of(a, b)
+            val to = Area(from.col1 + dc, from.row1 + dr, from.col2 + dc, from.row2 + dr)
+
+            if covers(from, there) then return Some((moved(a, dc, dr), moved(b, dc, dr)))
+            if covers(to, there) then return None
+
+            Some((a, b))
+end ends
+
+// One end copied: its relative parts moved, its pinned ones kept, a missing part (the row of a
+// whole-column reference) left missing.
+private copied(r: Ref, dc: int, dr: int) -> Option[Ref]
+    val col = if r.col < 0 || r.col_abs then r.col else r.col + dc
+    val row = if r.row < 0 || r.row_abs then r.row else r.row + dr
+
+    if (r.col >= 0 && (col < 0 || col >= MAX_COLS)) || (r.row >= 0 && (row < 0 || row >= MAX_ROWS)) then return None
+
+    Some(Ref(col, row, r.col_abs, r.row_abs))
+end copied
+
+// One end of a moved reference: it goes where its cell went, pinned or not.
+private moved(r: Ref, dc: int, dr: int) -> Ref =
+    Ref(if r.col < 0 then r.col else r.col + dc, if r.row < 0 then r.row else r.row + dr, r.col_abs, r.row_abs)
+
+// Does `outer` hold all of `inner`?
+private covers(outer: Area, inner: Area) -> bool =
+    inner.col1 >= outer.col1 && inner.col2 <= outer.col2 && inner.row1 >= outer.row1 && inner.row2 <= outer.row2
+
+// A reference's ends across rows (or columns) inserted or deleted. A reference with no part on that
+// axis -- a whole column, to a row insertion -- is untouched. The lower end follows the rule for a
+// range's first row and the higher one the rule for its last, which for a single cell agree.
+private along(a: Ref, b: Ref, rows: bool, at: int, n: int, inserting: bool) -> Option[(Ref, Ref)]
+    val pa = part(a, rows)
+    val pb = part(b, rows)
+
+    if pa < 0 then return Some((a, b))
+
+    val single = pa == pb && a == b
+    val limit = if rows then MAX_ROWS else MAX_COLS
+    val lo = pa.min(pb)
+    val hi = pa.max(pb)
+    var lo2 = lo
+    var hi2 = hi
+
+    if inserting
+        if lo >= at then lo2 = lo + n
+        if hi >= at then hi2 = hi + n
+
+        if lo2 >= limit then return None
+
+        // A range pushed past the edge keeps what is left of it; a cell has nowhere to be.
+        if hi2 >= limit
+            if single then return None
+
+            hi2 = limit - 1
+    else
+        // An end inside the rows deleted moves to the edge of what is left of the range.
+        lo2 = if lo >= at + n then lo - n elif lo >= at then at else lo
+        hi2 = if hi >= at + n then hi - n elif hi >= at then at - 1 else hi
+
+        if hi2 < lo2 then return None
+
+    // Each end takes the new value of the place it held.
+    val na = if pa == lo then lo2 else hi2
+    val nb = if pb == lo && (pa != lo || single) then lo2 else hi2
+
+    Some((with_part(a, rows, na), with_part(b, rows, nb)))
+end along
+
+private part(r: Ref, rows: bool) -> int = if rows then r.row else r.col
+
+private with_part(r: Ref, rows: bool, v: int) -> Ref =
+    if rows then Ref(r.col, v, r.col_abs, r.row_abs) else Ref(v, r.row, r.col_abs, r.row_abs)

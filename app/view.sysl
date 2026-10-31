@@ -61,21 +61,25 @@ private menus(m: &Model) -> &View =
             item("Quit", () -> stop(), "Ctrl+Q"),
         ]),
         menu("Edit", [
-            item("Undo", () -> (), "Ctrl+Z", enabled = false),
-            item("Redo", () -> (), "Ctrl+Y", enabled = false),
+            item("Undo", () -> m.undo(), "Ctrl+Z", enabled = m.sheet.can_undo()),
+            item("Redo", () -> m.redo(), "Ctrl+Y", enabled = m.sheet.can_redo()),
             separator(),
-            item("Cut", () -> (), "Ctrl+X", enabled = false),
-            item("Copy", () -> (), "Ctrl+C", enabled = false),
-            item("Paste", () -> (), "Ctrl+V", enabled = false),
+            item("Cut", () -> cut_out(m), "Ctrl+X"),
+            item("Copy", () -> copy_out(m), "Ctrl+C"),
+            item("Paste", () -> paste_in(m), "Ctrl+V"),
             separator(),
+            item("Fill down", () -> m.fill_down(), "Ctrl+D"),
+            item("Fill right", () -> m.fill_right(), "Ctrl+R"),
             item("Clear contents", () -> m.clear(), "Del"),
-            item("Delete cells…", () -> (), enabled = false),
             separator(),
             item("Select all", () -> m.select_all(), "Ctrl+A"),
         ]),
         menu("Insert", [
-            item("Row above", () -> (), enabled = false),
-            item("Column left", () -> (), enabled = false),
+            item("Row above", () -> m.insert_rows()),
+            item("Column left", () -> m.insert_cols()),
+            separator(),
+            item("Delete row", () -> m.delete_rows()),
+            item("Delete column", () -> m.delete_cols()),
         ]),
         menu("Format", [
             item("Standard column width", () -> m.standard_width()),
@@ -301,10 +305,10 @@ private point(m: &Model, c: *Canvas, at: Layout)
         m.drag(at.col_at(px), row_at(m, at, py))
 
     if c.grab(at.heads, DRAG_HEADS)
-        if m.resizing >= 0 then m.set_width(m.resizing, px - m.resize_x)
+        if m.resizing >= 0 then m.drag_width(px - m.resize_x)
         else m.drag_column(at.col_at(px))
     else
-        m.resizing = -1
+        m.end_resize()
 
     if c.grab(at.numbers, DRAG_NUMBERS) then m.drag_row(row_at(m, at, py))
 end point
@@ -355,6 +359,14 @@ private draw(m: &Model, c: *Canvas, r: Rect, at: Layout)
 
     box match
         Some(b) -> c.stroke(Rect(b.x - 1, b.y - 1, b.w + 1, b.h + 1), ACTIVE, 2)
+        None -> ()
+
+    // What a copy or a cut took, outlined in dashes until it is pasted, edited past, or let go.
+    m.marked match
+        Some(k) ->
+            on_screen(m, at, k) match
+                Some(b) -> c.stroke(Rect(b.x - 1, b.y - 1, b.w + 1, b.h + 1), ACTIVE, 2, dash = 4)
+                None -> ()
         None -> ()
 
     if m.editing then draw_editor(m, c, at, th)

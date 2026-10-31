@@ -1,0 +1,140 @@
+module sh.sysl.abax
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+
+// Undo and redo.
+//
+// **A step is what its edit did to the inputs, not how to do it backwards**: for each cell it touched,
+// what had been typed there before and what is typed there after, and the same for each column width.
+// Undoing puts the befores back and redoing the afters, and the sheet recalculates as for any edit.
+//
+// Inverse operations were the other way, and they fail exactly where an editor is most needed: a
+// deleted row is not brought back by inserting one, since the row's cells are gone and every formula
+// that read them now says `#REF!`. A record of inputs puts all of that back by the one mechanism every
+// edit already goes through, it costs what the edit itself touched, and a paste of a thousand cells,
+// an insertion that moves half the sheet, and the typing of one number are each one step.
+
+// One cell's input before a step and after it; "" is an empty cell.
+struct CellChange
+    key: long
+    before: string
+    after: string
+
+// One column's own width before a step and after it; 0 is the standard width.
+struct WidthChange
+    col: int
+    before: int
+    after: int
+
+// One undoable edit.
+struct Step
+    cells: Buf[CellChange]
+    widths: Buf[WidthChange]
+
+struct Journal
+    undo: Buf[Step]
+    redo: Buf[Step]
+    // The step being made: what each cell and width touched so far held before it, in the order first
+    // touched.
+    befores: Map[long, string]
+    order: Buf[long]
+    width_befores: Map[int, int]
+    width_order: Buf[int]
+    // False while an undo or a redo is replayed, which is not itself a step.
+    recording: bool
+
+    // A cell about to change, noted the first time in a step.
+    note(*self, k: long, before: string)
+        if !self.recording || self.befores.has(k) then return
+
+        self.befores.put(k, before)
+        self.order.push(k)
+
+    note_width(*self, col: int, before: int)
+        if !self.recording || self.width_befores.has(col) then return
+
+        self.width_befores.put(col, before)
+        self.width_order.push(col)
+
+    // The step made so far, with what each thing holds now as its after, and a fresh one begun. A
+    // cell written back to what it held is no change and is left out.
+    close(*self, cells: Map[long, Slot], widths: Map[int, int]) -> Step
+        var step = Step(buf(), buf())
+
+        for i in 0..<self.order.len()
+            val k = self.order[i]
+            val before = self.befores.get(k).unwrap_or("")
+            val after = cells.get(k) match
+                Some(slot) -> slot.input
+                None -> ""
+
+            if before != after then step.cells.push(CellChange(k, before, after))
+
+        for i in 0..<self.width_order.len()
+            val col = self.width_order[i]
+            val before = self.width_befores.get(col).unwrap_or(0)
+            val after = widths.get(col).unwrap_or(0)
+
+            if before != after then step.widths.push(WidthChange(col, before, after))
+
+        self.befores.clear()
+        self.order.clear()
+        self.width_befores.clear()
+        self.width_order.clear()
+        step
+    end close
+end Journal
+
+journal() -> Journal = Journal(buf(), buf(), map(), buf(), map(), buf(), true)
+
+impl Sheet
+    // The last edit taken back; false if there is none.
+    undo(*self) -> bool
+        val step = self.journal.undo.pop() match
+            Some(s) -> s
+            None -> return false
+
+        self.replay(step, true)
+        self.journal.redo.push(step)
+        true
+    end undo
+
+    // The last edit undone made again; false if there is none, or a new edit has been made since.
+    redo(*self) -> bool
+        val step = self.journal.redo.pop() match
+            Some(s) -> s
+            None -> return false
+
+        self.replay(step, false)
+        self.journal.undo.push(step)
+        true
+    end redo
+
+    can_undo(self) -> bool = self.journal.undo.len() > 0
+
+    can_redo(self) -> bool = self.journal.redo.len() > 0
+
+    // The history dropped: what a sheet just opened or built by a program starts from.
+    forget_history(*self)
+        self.journal.undo.clear()
+        self.journal.redo.clear()
+
+    private replay(*self, step: Step, back: bool)
+        self.journal.recording = false
+
+        for i in 0..<step.cells.len()
+            val c = step.cells[i]
+
+            // Every input in a step was read once already, so it reads again.
+            val _ = self.put(c.key, if back then c.before else c.after)
+
+        for i in 0..<step.widths.len()
+            val w = step.widths[i]
+
+            self.put_width(w.col, if back then w.before else w.after)
+
+        self.settle()
+        self.journal.recording = true
+    end replay
+end Sheet

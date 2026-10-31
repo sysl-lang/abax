@@ -42,6 +42,17 @@ Named for the *abax* (ἄβαξ), the Greek counting board — a table of cells 
 - **Coercion follows Excel**: text that reads as a number is one in arithmetic, `TRUE` is 1, an empty
   cell is 0 or "" by context, and a function given a range skips text where Excel does (`SUM`) and
   counts it where Excel does (`COUNTA`).
+- **Editing follows Excel's reference rules**: a copied formula moves its relative parts and keeps
+  its `$` parts; inserting or deleting rows and columns moves every reference past them, `$` or not,
+  grows or shrinks a range, and turns a reference to a deleted cell into `#REF!`; a cut and paste
+  moves the cells and every reference to them.
+- **Undo records inputs, not inverse operations**: a step is, for each cell and column width it
+  touched, what was there before and after. Undo puts the befores back through the same path as any
+  edit. An inverse cannot bring back a deleted row, or the formulas that became `#REF!` when it went;
+  a record of inputs can, at the cost of what the edit touched.
+- **The system clipboard carries displayed values**, tab-separated, as Excel gives other programs;
+  abax's own copy keeps the inputs, and a paste uses them while the clipboard still holds the text
+  that copy put there.
 - **Numbers are shown in General format** — up to eleven significant figures, switching to scientific
   where Excel does — and written to files as the shortest text that reads back to the same `real`.
 

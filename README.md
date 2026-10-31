@@ -55,8 +55,8 @@ app/abax-app --demo             a small budget to look at
 app/abax-app --demo --select B4:D8 --shot shot.png
 ```
 
-`--shot` draws one frame with no window and writes it to a PNG; `--cell B2==SUM(A1:A9)` (repeatable)
-and `--select` set the sheet up first, so the picture can be checked by a program.
+`--shot` draws one frame with no window and writes it to a PNG; `--cell B2==SUM(A1:A9)` (repeatable),
+`--cut` and `--select` set the sheet up first, so the picture can be checked by a program.
 
 | Key | Does |
 |---|---|
@@ -71,11 +71,23 @@ and `--select` set the sheet up first, so the picture can be checked by a progra
 | a click on a column letter or row number, or the corner | the whole column, row or sheet |
 | a drag on a column letter's right edge | the column's width |
 | Ctrl+N, Ctrl+Q, Ctrl+A | new sheet, quit, select all (⌘ on a Mac) |
+| Ctrl+Z; Ctrl+Y or Ctrl+Shift+Z | undo; redo — every edit, a paste or an insertion being one step |
+| Ctrl+C, Ctrl+X, Ctrl+V | copy, cut, paste; Escape lets the dashed outline of a copy or cut go |
+| Ctrl+D, Ctrl+R | fill down, fill right |
+
+**Copy and paste** follow Excel. A pasted formula moves its relative references by how far it
+travelled and keeps its `$` ones; one cell pasted into a selection fills it. A cut pasted *moves*
+the cells, and every formula that read them follows them. The system clipboard gets what the cells
+show, as tab-separated text, so another program receives values; a paste from abax's own copy brings
+the formulas, and text from another program is pasted as if typed. **Insert** adds rows above or
+columns to the left of the selection, and deletes the selected rows or columns, adjusting every
+formula on the sheet — a reference to a deleted cell becomes `#REF!`, a range losing some of its rows
+shrinks.
 
 Typing an address or a range (`B7`, `B2:D9`, `C:E`, `3:5`) into the name box and pressing Enter
-selects it. A formula typed into the formula bar goes into the active cell on Enter. Saving and
-opening files, copy and paste, and undo are not written yet; their menu items are there, disabled or
-saying so.
+selects it. A formula typed into the formula bar goes into the active cell on Enter; one calling a
+function with the wrong number of arguments is refused there, with a message. Saving and opening
+files are not written yet; their menu items say so.
 
 ## Licence
 

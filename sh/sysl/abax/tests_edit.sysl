@@ -1,0 +1,588 @@
+module sh.sysl.abax
+@tests
+
+private area(text: string) -> Area = parse_area(text).unwrap()
+
+// A cell's formula, or what was typed into it when it holds a constant.
+private shown(s: Sheet, addr: string) -> string = s.formula(addr).unwrap_or(s.input(addr))
+
+// A formula adjusted, as text, or the message it did not parse with.
+private moved(text: string, how: Adjust) -> string
+    parse_formula(text) match
+        Ok(e) -> formula_text(adjust(e, "Sheet1", how))
+        Err(m) -> "error: " + m
+
+// --- Ranges as typed -------------------------------------------------------------------------------
+
+@test("an area reads as a cell, a range, whole columns or whole rows, dollars and spaces allowed")
+areas_read()
+    assert(parse_area("B7") == Some(Area(1, 6, 1, 6)))
+    assert(parse_area("A1:C3") == Some(Area(0, 0, 2, 2)))
+    assert(parse_area("C3:A1") == Some(Area(0, 0, 2, 2)))
+    assert(parse_area("$A$1:B2") == Some(Area(0, 0, 1, 1)))
+    assert(parse_area("C:E") == Some(Area(2, 0, 4, MAX_ROWS - 1)))
+    assert(parse_area("$C:$C") == Some(Area(2, 0, 2, MAX_ROWS - 1)))
+    assert(parse_area("3:5") == Some(Area(0, 2, MAX_COLS - 1, 4)))
+    assert(parse_area("$3:$5") == Some(Area(0, 2, MAX_COLS - 1, 4)))
+    assert(parse_area("  b2:c3 ") == Some(Area(1, 1, 2, 2)))
+    assert(parse_area("XFD1048576") == Some(Area(MAX_COLS - 1, MAX_ROWS - 1, MAX_COLS - 1, MAX_ROWS - 1)))
+
+@test("what is not an area is refused: a lone column or row, mixed ends, junk after, past the sheet")
+areas_refused()
+    assert(parse_area("").is_none())
+    assert(parse_area("C").is_none())
+    assert(parse_area("3").is_none())
+    assert(parse_area("A1:3").is_none())
+    assert(parse_area("A:3").is_none())
+    assert(parse_area("A1:").is_none())
+    assert(parse_area("A1:B2:C3").is_none())
+    assert(parse_area("A1 B2").is_none())
+    assert(parse_area("XFE1").is_none())
+    assert(parse_area("A0").is_none())
+    assert(parse_area("A1048577").is_none())
+    assert(parse_area("Sheet1!A1").is_none())
+
+// --- Arity -----------------------------------------------------------------------------------------
+
+@test("a call with the wrong number of arguments is refused at entry, and the cell keeps what it had")
+arity_refused()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "5").unwrap()
+    assert(s.set("A1", "=ROUND(1)") == Err("ROUND takes 2 arguments, not 1"))
+    assert(s.set("A1", "=sum()") == Err("SUM takes at least 1 argument, not 0"))
+    assert(s.set("A1", "=VLOOKUP(1,B1:C2)") == Err("VLOOKUP takes 3 to 4 arguments, not 2"))
+    assert(s.set("A1", "=IF(1,2,3,4)") == Err("IF takes 1 to 3 arguments, not 4"))
+    assert(s.set("A1", "=1+NOT(1,2)") == Err("NOT takes 1 argument, not 2"))
+    assert(s.set("A1", "=SUM(1,LEN())") == Err("LEN takes 1 argument, not 0"))
+    assert(s.value("A1") == Number(5.0))
+    assert(!s.can_redo())
+
+    // An empty argument is an argument; a name nobody wrote is #NAME? at evaluation, not refused.
+    s.set("A2", "=IF(1,,2)").unwrap()
+    s.set("A3", "=NOSUCH(1,2,3)").unwrap()
+    assert_eq(s.display("A3"), "#NAME?")
+    assert(arity_of("PI") == Some((0, 0)))
+    assert(arity_of("COUNTBLANK") == Some((1, 1)))
+    assert(arity_of("NOSUCH").is_none())
+
+    // Every function the engine knows has an arity.
+    for f in FUNCTIONS
+        assert(arity_of(f).is_some(), f)
+
+// --- Adjusting references --------------------------------------------------------------------------
+
+@test("a copied formula moves its relative parts and keeps its dollar parts")
+copied_refs()
+    assert_eq(moved("A1+$B$1+$C1+D$1", Copied(1, 2)), "B3+$B$1+$C3+E$1")
+    assert_eq(moved("SUM(A1:B2)*Other!A1", Copied(2, 0)), "SUM(C1:D2)*Other!C1")
+    assert_eq(moved("SUM(A:A)+SUM(1:1)", Copied(1, 1)), "SUM(B:B)+SUM(2:2)")
+    assert_eq(moved("SUM($A:$A)", Copied(3, 3)), "SUM($A:$A)")
+    assert_eq(moved("(A2)%", Copied(0, -1)), "(A1)%")
+
+@test("a copied reference falling off the sheet becomes #REF!, the rest of the formula kept")
+copied_off_sheet()
+    assert_eq(moved("A1+B2", Copied(0, -1)), "#REF!+B1")
+    assert_eq(moved("SUM(A1:A3)", Copied(-1, 0)), "SUM(#REF!)")
+    assert_eq(moved("$A$1+A1", Copied(-1, -1)), "$A$1+#REF!")
+    assert_eq(moved("XFD1", Copied(1, 0)), "#REF!")
+    assert_eq(moved("A1048576", Copied(0, 1)), "#REF!")
+
+@test("inserted rows move references past them, dollars or not, and grow a range they land inside")
+inserted_refs()
+    val how = Inserted(true, 4, 2)
+
+    assert_eq(moved("A4+A5+$A$5+A6", how), "A4+A7+$A$7+A8")
+    assert_eq(moved("SUM(A1:A4)", how), "SUM(A1:A4)")
+    assert_eq(moved("SUM(A1:A5)", how), "SUM(A1:A7)")
+    assert_eq(moved("SUM(A5:A9)", how), "SUM(A7:A11)")
+    assert_eq(moved("SUM(A9:A2)", how), "SUM(A11:A2)")
+    assert_eq(moved("SUM(B:B)+SUM(5:6)", how), "SUM(B:B)+SUM(7:8)")
+    assert_eq(moved("Other!A9", how), "Other!A9")
+    assert_eq(moved("A1048575+SUM(A1:A1048576)", how), "#REF!+SUM(A1:A1048576)")
+    assert_eq(moved("C1+E1+SUM(B1:F1)", Inserted(false, 3, 1)), "C1+F1+SUM(B1:G1)")
+
+@test("deleted rows close up references, shrink a range that loses some, and #REF! one losing all")
+deleted_refs()
+    val how = Deleted(true, 4, 2)
+
+    assert_eq(moved("A4+A5+A6+A7+$A$9", how), "A4+#REF!+#REF!+A5+$A$7")
+    assert_eq(moved("SUM(A1:A10)", how), "SUM(A1:A8)")
+    assert_eq(moved("SUM(A5:A10)", how), "SUM(A5:A8)")
+    assert_eq(moved("SUM(A1:A5)", how), "SUM(A1:A4)")
+    assert_eq(moved("SUM(A5:A6)", how), "SUM(#REF!)")
+    assert_eq(moved("SUM(A6:A5)", how), "SUM(#REF!)")
+    assert_eq(moved("SUM(A10:A3)", how), "SUM(A8:A3)")
+    assert_eq(moved("SUM(C:C)", how), "SUM(C:C)")
+    assert_eq(moved("SUM(5:5)+SUM(4:7)", how), "SUM(#REF!)+SUM(4:5)")
+    assert_eq(moved("B1+C1+D1+SUM(A1:D1)", Deleted(false, 1, 2)), "#REF!+#REF!+B1+SUM(A1:B1)")
+
+@test("a move takes the references to the moved cells along, and #REF!s those it wrote over")
+moved_refs()
+    val how = Moved(Area(0, 0, 1, 1), 2, 0)
+
+    assert_eq(moved("A1+$B$2+SUM(A1:B2)+SUM(A1:B3)", how), "C1+$D$2+SUM(C1:D2)+SUM(A1:B3)")
+    assert_eq(moved("C1+D2+SUM(C1:D2)+E1", how), "#REF!+#REF!+SUM(#REF!)+E1")
+    assert_eq(moved("Other!A1", how), "Other!A1")
+
+// --- Copy and paste --------------------------------------------------------------------------------
+
+@test("a paste shifts relative references by how far each cell travelled, and writes over everything")
+paste_shifts()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "1").unwrap()
+    s.set("A2", "2").unwrap()
+    s.set("B1", "=A1*10").unwrap()
+    s.set("B2", "=A2+$A$1").unwrap()
+    s.set("D5", "old").unwrap()
+    s.set("C6", "old").unwrap()
+    s.set("D6", "old").unwrap()
+
+    val clip = s.copy(area("A1:B2"))
+
+    s.set("A1", "100").unwrap()
+    assert(s.paste(clip, area("C5")) == Ok(area("C5:D6")))
+    assert_eq(shown(s, "C5"), "1")
+    assert_eq(shown(s, "D5"), "=C5*10")
+    assert_eq(shown(s, "D6"), "=C6+$A$1")
+    assert_eq(s.display("D5"), "10")
+    assert_eq(s.display("D6"), "102")
+    assert_eq(shown(s, "C6"), "2")
+
+    // An empty cell of the clip empties the cell it lands on.
+    s.set("F1", "keep").unwrap()
+    s.set("F2", "gone").unwrap()
+
+    val holey = s.copy(area("E1:E2"))
+
+    assert(s.paste(holey, area("F1")) == Ok(area("F1:F2")))
+    assert_eq(s.input("F2"), "")
+    assert_eq(s.input("F1"), "")
+
+@test("one cell pasted into a selection fills it, and a whole multiple of a clip tiles it")
+paste_fills()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "=ROW1+B1").unwrap()
+    s.set("B1", "3").unwrap()
+    s.set("Z1", "=Y1").unwrap()
+
+    assert(s.paste(s.copy(area("Z1")), area("C1:D3")) == Ok(area("C1:D3")))
+    assert_eq(shown(s, "C1"), "=B1")
+    assert_eq(shown(s, "D3"), "=C3")
+
+    s.set("H1", "a").unwrap()
+    s.set("H2", "b").unwrap()
+    assert(s.paste(s.copy(area("H1:H2")), area("J1:K4")) == Ok(area("J1:K4")))
+    assert_eq(s.input("K3"), "a")
+    assert_eq(s.input("K4"), "b")
+
+    // A selection that is not a multiple takes one copy at its corner.
+    assert(s.paste(s.copy(area("H1:H2")), area("M1:M3")) == Ok(area("M1:M2")))
+    assert_eq(s.input("M3"), "")
+
+@test("a paste that would not fit on the sheet, or would write too much, is refused and changes nothing")
+paste_refused()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "x").unwrap()
+    s.set("A2", "y").unwrap()
+
+    val clip = s.copy(area("A1:A2"))
+    val steps = s.journal.undo.len()
+
+    assert(s.paste(clip, area("B1048576")) == Err("the paste does not fit on the sheet"))
+    assert(s.paste(s.copy(area("A1")), area("B:C")) == Err("the paste would write 2097152 cells, more than 1000000"))
+    assert(s.paste(s.copy(area("A:A")), area("B2")) == Err("the paste does not fit on the sheet"))
+    assert_eq(s.input("B1048575"), "")
+    assert(s.journal.undo.len() == steps)
+
+    // A whole column pasted at the top of another is whole.
+    assert(s.paste(s.copy(area("A:A")), area("C1")) == Ok(area("C:C")))
+    assert_eq(s.input("C2"), "y")
+
+// --- Cut and move ----------------------------------------------------------------------------------
+
+@test("cut and paste moves cells: formulas reading them follow, and their own formulas are not shifted")
+cut_moves()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "4").unwrap()
+    s.set("A2", "=A1*2").unwrap()
+    s.set("A3", "=B9").unwrap()
+    s.set("B9", "7").unwrap()
+    s.set("C1", "=A1+A2+SUM(A1:A2)").unwrap()
+    s.set("E3", "=E2").unwrap()
+
+    assert(s.paste(s.cut(area("A1:A3")), area("E1")) == Ok(area("E1:E3")))
+    assert_eq(s.input("A1"), "")
+    assert_eq(s.input("A2"), "")
+    assert_eq(shown(s, "E2"), "=E1*2")
+    assert_eq(shown(s, "E3"), "=B9")
+    assert_eq(shown(s, "C1"), "=E1+E2+SUM(E1:E2)")
+    assert_eq(s.display("C1"), "24")
+    assert_eq(s.display("E3"), "7")
+
+    // The dependency index follows the move: a change to the moved cell reaches its readers.
+    s.set("E1", "5").unwrap()
+    assert_eq(s.display("C1"), "30")
+    s.set("A1", "1000").unwrap()
+    assert_eq(s.display("C1"), "30")
+
+@test("a formula reading a cell a move wrote over says #REF!, and a move onto itself is nothing")
+move_overwrites()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "1").unwrap()
+    s.set("B1", "2").unwrap()
+    s.set("C1", "=B1*3").unwrap()
+
+    val steps = s.journal.undo.len()
+
+    assert(s.move(area("A1"), 0, 0) == Ok(area("A1")))
+    assert(s.journal.undo.len() == steps)
+    assert(s.move(area("A1"), 1, 0) == Ok(area("B1")))
+    assert_eq(shown(s, "C1"), "=#REF!*3")
+    assert_eq(s.display("C1"), "#REF!")
+    assert_eq(s.input("B1"), "1")
+    assert(s.move(area("B1"), MAX_COLS, 0).is_err())
+
+@test("a move keeps a formula's input exactly as typed where its references did not change")
+move_keeps_typing()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "=sum( 1 , 2 )").unwrap()
+    s.move(area("A1"), 3, 3).unwrap()
+    assert_eq(s.input("D4"), "=sum( 1 , 2 )")
+
+// --- Fill ------------------------------------------------------------------------------------------
+
+@test("fill down copies the top row into the rest, and a single row takes the row above")
+fill_down_fills()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "1").unwrap()
+    s.set("B1", "=A1*2").unwrap()
+    s.set("A2", "old").unwrap()
+
+    assert(s.fill_down(area("A1:B4")) == Ok(area("A2:B4")))
+    assert_eq(s.input("A4"), "1")
+    assert_eq(shown(s, "B4"), "=A4*2")
+
+    s.set("C5", "=B5").unwrap()
+    assert(s.fill_down(area("C6:C6")) == Ok(area("C6")))
+    assert_eq(shown(s, "C6"), "=B6")
+
+    // The top row has nothing above to take.
+    assert(s.fill_down(area("D1")) == Ok(area("D1")))
+    assert_eq(s.input("D1"), "")
+
+@test("fill right copies the left column into the rest, and a single column takes the one to its left")
+fill_right_fills()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "=A2").unwrap()
+    s.set("A2", "9").unwrap()
+
+    assert(s.fill_right(area("A1:C1")) == Ok(area("B1:C1")))
+    assert_eq(shown(s, "C1"), "=C2")
+
+    assert(s.fill_right(area("B2")) == Ok(area("B2")))
+    assert_eq(s.input("B2"), "9")
+    assert(s.fill_right(area("A5")) == Ok(area("A5")))
+
+// --- Rows and columns ------------------------------------------------------------------------------
+
+@test("inserting rows moves cells down and every reference with them, recalculating only what changed")
+insert_rows_moves()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "1").unwrap()
+    s.set("B1", "=A1").unwrap()
+    s.set("A5", "5").unwrap()
+    s.set("A6", "6").unwrap()
+    s.set("B6", "=SUM(A1:A6)").unwrap()
+    s.set("C1", "=A5*$A$6").unwrap()
+
+    val before = s.evaluations
+
+    s.insert_rows(4, 2).unwrap()
+    assert_eq(s.input("A7"), "5")
+    assert_eq(s.input("A5"), "")
+    assert_eq(shown(s, "B8"), "=SUM(A1:A8)")
+    assert_eq(shown(s, "C1"), "=A7*$A$8")
+    assert_eq(shown(s, "B1"), "=A1")
+    assert_eq(s.display("B8"), "12")
+    assert_eq(s.display("C1"), "30")
+    // B8 and C1 were rewritten; B1 was not, and was not worked out again.
+    assert(s.evaluations - before == 2)
+
+    // The index follows: the moved cells reach their readers, and the rows opened are in the range.
+    s.set("A7", "10").unwrap()
+    assert_eq(s.display("C1"), "60")
+    s.set("A5", "100").unwrap()
+    assert_eq(s.display("B8"), "117")
+
+@test("inserting is refused when it would push something off the sheet, and needs a real place")
+insert_refused()
+    var s = sheet("Sheet1")
+
+    s.set("A1048576", "last").unwrap()
+    assert(s.insert_rows(0, 1).is_err())
+    assert(s.insert_cols(0, 1).is_ok())
+    assert(s.insert_rows(-1, 1).is_err())
+    assert(s.insert_rows(3, 0).is_err())
+    assert(s.insert_cols(MAX_COLS, 1).is_err())
+    assert_eq(s.input("B1048576"), "last")
+
+@test("deleting rows closes them up: references past them move, ranges shrink, the deleted are #REF!")
+delete_rows_closes()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "1").unwrap()
+    s.set("A2", "2").unwrap()
+    s.set("A3", "3").unwrap()
+    s.set("A4", "4").unwrap()
+    s.set("B1", "=SUM(A1:A4)").unwrap()
+    s.set("C1", "=A2+A4").unwrap()
+    s.set("D1", "=SUM(A2:A3)").unwrap()
+    s.set("B4", "=A4").unwrap()
+
+    s.delete_rows(1, 2).unwrap()
+    assert_eq(shown(s, "B1"), "=SUM(A1:A2)")
+    assert_eq(s.display("B1"), "5")
+    assert_eq(shown(s, "C1"), "=#REF!+A2")
+    assert_eq(shown(s, "D1"), "=SUM(#REF!)")
+    assert_eq(shown(s, "B2"), "=A2")
+    assert_eq(s.input("A2"), "4")
+    assert_eq(s.input("A4"), "")
+    assert_eq(s.input("B4"), "")
+
+    s.set("A2", "40").unwrap()
+    assert_eq(s.display("B1"), "41")
+    assert_eq(s.display("B2"), "40")
+
+    // Deleting past the end is cut to the sheet.
+    assert(s.delete_rows(MAX_ROWS - 1, 5).is_ok())
+    assert(s.delete_rows(MAX_ROWS, 1).is_err())
+
+@test("inserting and deleting columns moves cells, references and widths across")
+columns_move()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "2").unwrap()
+    s.set("C1", "3").unwrap()
+    s.set("A2", "=A1*C1").unwrap()
+    s.set_width(2, 150)
+
+    s.insert_cols(1, 1).unwrap()
+    assert_eq(s.input("D1"), "3")
+    assert_eq(shown(s, "A2"), "=A1*D1")
+    assert(s.width(3) == Some(150))
+    assert(s.width(2).is_none())
+
+    s.delete_cols(3, 1).unwrap()
+    assert_eq(shown(s, "A2"), "=A1*#REF!")
+    assert(s.width(3).is_none())
+
+// --- Undo and redo ---------------------------------------------------------------------------------
+
+@test("every edit is undone and redone, and a new edit clears what could be redone")
+undo_redo()
+    var s = sheet("Sheet1")
+
+    assert(!s.can_undo())
+    assert(!s.undo())
+    s.set("A1", "1").unwrap()
+    s.set("A2", "=A1+1").unwrap()
+    s.set("A1", "5").unwrap()
+    assert_eq(s.display("A2"), "6")
+    assert(s.undo())
+    assert_eq(s.display("A2"), "2")
+    assert(s.undo())
+    assert_eq(s.input("A2"), "")
+    assert(s.redo())
+    assert_eq(s.display("A2"), "2")
+    assert(s.can_redo())
+
+    s.set("B1", "x").unwrap()
+    assert(!s.can_redo())
+    assert(!s.redo())
+
+    // Setting a cell to what it holds is no step.
+    val steps = s.journal.undo.len()
+
+    s.set("B1", "x").unwrap()
+    assert(s.journal.undo.len() == steps)
+
+@test("a paste of many cells, a fill and a clear are each one step")
+multi_cell_steps()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "=B1").unwrap()
+    s.set("B1", "1").unwrap()
+    s.set("C3", "keep me").unwrap()
+
+    val steps = s.journal.undo.len()
+
+    s.paste(s.copy(area("A1")), area("C1:C5")).unwrap()
+    assert(s.journal.undo.len() == steps + 1)
+    s.fill_right(area("A1:D1")).unwrap()
+    s.clear(area("A1:D5"))
+    assert(s.journal.undo.len() == steps + 3)
+    assert(s.count() == 0)
+
+    assert(s.undo())
+    assert_eq(shown(s, "D1"), "=E1")
+    assert(s.undo())
+    assert(s.undo())
+    assert_eq(s.input("C3"), "keep me")
+    assert_eq(s.input("C4"), "")
+    assert_eq(s.display("A1"), "1")
+
+@test("undoing a deletion brings back the cells and the formulas that had become #REF!")
+undo_delete()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "1").unwrap()
+    s.set("A2", "2").unwrap()
+    s.set("A3", "3").unwrap()
+    s.set("B1", "=A2*10").unwrap()
+    s.set("B2", "=SUM(A1:A3)").unwrap()
+    s.set_width(3, 99)
+
+    s.delete_rows(1, 1).unwrap()
+    s.delete_cols(3, 1).unwrap()
+    assert_eq(shown(s, "B1"), "=#REF!*10")
+    assert(s.undo())
+    assert(s.width(3) == Some(99))
+    assert(s.undo())
+    assert_eq(shown(s, "B1"), "=A2*10")
+    assert_eq(s.display("B1"), "20")
+    assert_eq(shown(s, "B2"), "=SUM(A1:A3)")
+    assert_eq(s.display("B2"), "6")
+    assert_eq(s.input("A3"), "3")
+
+    // The index is right after an undo: A2 reaches B1 again.
+    s.set("A2", "7").unwrap()
+    assert_eq(s.display("B1"), "70")
+
+    assert(s.undo())
+    assert_eq(s.display("B1"), "20")
+    assert(s.redo())
+    assert_eq(s.display("B1"), "70")
+    assert(!s.redo())
+
+@test("undoing a move puts the cells and every reference to them back")
+undo_move()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "3").unwrap()
+    s.set("B1", "=A1").unwrap()
+    s.move(area("A1"), 0, 4).unwrap()
+    assert_eq(shown(s, "B1"), "=A5")
+    assert(s.undo())
+    assert_eq(shown(s, "B1"), "=A1")
+    assert_eq(s.input("A5"), "")
+    s.set("A1", "8").unwrap()
+    assert_eq(s.display("B1"), "8")
+
+@test("column widths are undoable, and taking a width away is a step too")
+width_steps()
+    var s = sheet("Sheet1")
+
+    s.set_width(1, 120)
+    s.set_width(1, 140)
+    s.reset_widths(0, 5)
+    assert(s.width(1).is_none())
+    assert(s.undo())
+    assert(s.width(1) == Some(140))
+    assert(s.undo())
+    assert(s.width(1) == Some(120))
+    assert(s.undo())
+    assert(s.width(1).is_none())
+
+@test("forgetting the history leaves nothing to undo or redo")
+forgotten()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "1").unwrap()
+    s.forget_history()
+    assert(!s.undo())
+    assert_eq(s.input("A1"), "1")
+
+// --- Tab-separated text ----------------------------------------------------------------------------
+
+@test("an area as text is what each cell shows, tab between cells, a line break after each row")
+tsv_out()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "=1/3").unwrap()
+    s.set("B1", "hello").unwrap()
+    s.set("A2", "=1/0").unwrap()
+    s.set("C2", "TRUE").unwrap()
+    s.set("A3", "=\"a\"&CHAR9").unwrap()
+
+    assert_eq(s.tsv(area("A1:C2")), "0.333333333\thello\t\n#DIV/0!\t\tTRUE\n")
+    assert_eq(s.tsv(area("B1")), "hello\n")
+    assert_eq(s.tsv(area("A:A")), "0.333333333\n#DIV/0!\n#NAME?\n")
+    assert_eq(sheet("Sheet1").tsv(area("A:A")), "")
+
+@test("text with tabs, line breaks or a leading quote is quoted, and reads back as it was")
+tsv_quoting()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "=\"a\"&\"\t\"&\"b\"").unwrap()
+    s.set("B1", "\"quoted\" word").unwrap()
+    s.set("C1", "plain \"inner\"").unwrap()
+
+    val text = s.tsv(area("A1:C1"))
+
+    assert_eq(text, "\"a\tb\"\t\"\"\"quoted\"\" word\"\tplain \"inner\"\n")
+
+    var t = sheet("Sheet1")
+
+    assert(t.paste_text(text, 0, 0) == Ok(area("A1:C1")))
+    assert_eq(t.input("A1"), "a\tb")
+    assert_eq(t.input("B1"), "\"quoted\" word")
+    assert_eq(t.input("C1"), "plain \"inner\"")
+
+@test("pasted text becomes inputs: numbers, formulas, empties that clear, any line ending")
+paste_text_in()
+    var s = sheet("Sheet1")
+
+    s.set("C2", "old").unwrap()
+    assert(s.paste_text("1\t2\r\n=A2+B2\t\tlast\r\n", 1, 0) == Ok(area("B1:D2")))
+    assert(s.value("B1") == Number(1.0))
+    assert_eq(shown(s, "B2"), "=A2+B2")
+    assert_eq(s.input("C2"), "")
+    assert_eq(s.input("D2"), "last")
+    assert_eq(s.input("D1"), "")
+    assert_eq(s.display("B2"), "#CIRC!")
+
+    // A formula that does not read is kept as text, and the whole paste is one step.
+    var t = sheet("Sheet1")
+
+    assert(t.paste_text("=SUM(\r=1+\rx", 0, 0) == Ok(area("A1:A3")))
+    assert_eq(t.input("A1"), "'=SUM(")
+    assert(t.value("A2") == Text("=1+"))
+    assert(t.undo())
+    assert(t.count() == 0)
+
+    assert(t.paste_text("", 0, 0) == Err("there is nothing to paste"))
+    assert(t.paste_text("a\tb", MAX_COLS - 1, 0) == Err("the paste does not fit on the sheet"))
+
+@test("tab-separated text reads into lines of fields")
+tsv_read()
+    assert(read_tsv("").len() == 0)
+    assert(read_tsv("\n").len() == 1)
+
+    val l = read_tsv("a\t\"b\nc\"\t\n\"\"\tx")
+
+    assert(l.len() == 2)
+    assert(l[0].len() == 3)
+    assert_eq(l[0][1], "b\nc")
+    assert_eq(l[0][2], "")
+    assert_eq(l[1][0], "")
+    assert_eq(l[1][1], "x")

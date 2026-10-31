@@ -124,6 +124,29 @@ parse_ref(text: string) -> Option[Ref]
         None -> None
 end parse_ref
 
+// A cell or a range as a person types one into a name box or a dialog: `B7`, `A1:C3`, `$A$1:B2`,
+// whole columns `C:E` or whole rows `3:5`, with spaces around it allowed. Both ends of a range are
+// the same shape -- `A1:3` is nothing -- and a lone column or row is nothing either.
+parse_area(text: string) -> Option[Area]
+    val t = text.trim()
+    val b = t.bytes
+    val first = read_ref(b, 0)?
+    val a = first.0
+
+    if first.1 == t.len
+        return if a.col >= 0 && a.row >= 0 then Some(cell_area(a.col, a.row)) else None
+
+    if b[first.1] != u8(':') then return None
+
+    val second = read_ref(b, first.1 + 1)?
+    val e = second.0
+
+    if second.1 != t.len then return None
+    if (e.col >= 0) != (a.col >= 0) || (e.row >= 0) != (a.row >= 0) then return None
+
+    Some(area_of(a, e))
+end parse_area
+
 // A cell reference read at `from`: `$`, letters, `$`, digits -- or only the letters, or only the
 // digits, for one end of a whole-column or whole-row range. It answers the reference and where it
 // ended, or nothing if what stands there is not a reference inside the sheet's limits.

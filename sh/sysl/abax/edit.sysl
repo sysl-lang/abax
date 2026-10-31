@@ -1,0 +1,468 @@
+module sh.sysl.abax
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.text.str_builder
+
+// Editing a sheet: clearing, copying and pasting, cutting and moving, filling, inserting and deleting
+// rows and columns, column widths, and tab-separated text to and from other programs. **Each of these
+// is one step of the undo history**, however many cells it touches.
+
+// The most cells one paste or fill may write. A fill of a whole column with a formula is a million
+// formulas, which a person does not mean and a sheet should not silently become.
+val MAX_PASTE: long = 1000000
+
+// One cell of a clip, by its place in the rectangle.
+struct ClipCell
+    dc: int
+    dr: int
+    input: string
+
+// A rectangle of cells taken to be pasted: where it was taken from, and what was typed into each cell
+// of it that holds something. A cut clip is pasted by moving the cells it names.
+struct Clip
+    area: Area
+    cells: Buf[ClipCell]
+    cut: bool
+
+    width(self) -> int = self.area.width()
+
+    height(self) -> int = self.area.height()
+end Clip
+
+impl Sheet
+    // --- Clearing -----------------------------------------------------------------------------------
+
+    // Every cell in an area emptied.
+    clear(*self, a: Area)
+        val ks = self.keys_in(a)
+
+        for i in 0..<ks.len()
+            val _ = self.put(ks[i], "")
+
+        self.settle()
+    end clear
+
+    // The stored cells inside an area, by key. It walks whichever is smaller, the area or the store.
+    keys_in(self, a: Area) -> Buf[long]
+        var out: Buf[long] = buf()
+        val c = self.clamp(a)
+
+        if c.col2 < c.col1 || c.row2 < c.row1 then return out
+
+        if c.size() <= long(self.cells.len())
+            for r in c.row1..c.row2
+                for k in c.col1..c.col2
+                    if self.cells.has(key(k, r)) then out.push(key(k, r))
+        else
+            for (k, _) in self.cells
+                if c.contains(col_of(k), row_of(k)) then out.push(k)
+
+        out
+    end keys_in
+
+    // --- Copying and pasting ------------------------------------------------------------------------
+
+    // The cells of an area, taken to be pasted.
+    copy(self, a: Area) -> Clip
+        var cells: Buf[ClipCell] = buf()
+        val ks = self.keys_in(a)
+
+        for i in 0..<ks.len()
+            cells.push(ClipCell(col_of(ks[i]) - a.col1, row_of(ks[i]) - a.row1, self.input_at(ks[i])))
+
+        Clip(a, cells, false)
+    end copy
+
+    // The cells of an area, taken to be moved by the next paste.
+    cut(self, a: Area) -> Clip
+        var c = self.copy(a)
+
+        c.cut = true
+        c
+    end cut
+
+    // A clip pasted into the selection `to`, whose formulas move their relative references by the
+    // distance each cell travels. A selection that is a whole number of the clip's rectangles across
+    // and down is filled with as many copies -- one copied cell fills every selected cell -- and any
+    // other selection takes one copy at its corner. What was in the cells pasted over is gone, empty
+    // cells of the clip included. A cut clip moves its cells instead. The answer is the area written.
+    paste(*self, clip: Clip, to: Area) -> Result[Area, string]
+        if clip.cut then return self.move(clip.area, to.col1, to.row1)
+
+        val w = clip.width()
+        val h = clip.height()
+        var across = 1
+        var down = 1
+
+        if to.width() % w == 0 && to.height() % h == 0
+            across = to.width() / w
+            down = to.height() / h
+
+        val target = Area(to.col1, to.row1, to.col1 + across * w - 1, to.row1 + down * h - 1)
+
+        if target.col2 >= MAX_COLS || target.row2 >= MAX_ROWS then return Err("the paste does not fit on the sheet")
+
+        val writes = long(across) * long(down) * long(clip.cells.len())
+
+        if writes > MAX_PASTE then return Err(s"the paste would write ${writes} cells, more than ${MAX_PASTE}")
+
+        val old = self.keys_in(target)
+
+        for i in 0..<old.len()
+            val _ = self.put(old[i], "")
+
+        for ty in 0..<down
+            for tx in 0..<across
+                // How far this copy of the clip is from where it was taken.
+                val dc = target.col1 + tx * w - clip.area.col1
+                val dr = target.row1 + ty * h - clip.area.row1
+
+                for i in 0..<clip.cells.len()
+                    val c = clip.cells[i]
+                    val input = if dc == 0 && dr == 0 then c.input else adjust_input(c.input, self.name, Copied(dc, dr))
+
+                    val _ = self.put(key(clip.area.col1 + c.dc + dc, clip.area.row1 + c.dr + dr), input)
+
+        self.settle()
+        Ok(target)
+    end paste
+
+    // The cells of `from` moved so that its corner is at `col`, `row`: cut and pasted. Every formula on
+    // the sheet that read them -- theirs included -- reads them where they now are, a moved formula is
+    // otherwise unchanged, and a formula that read a cell the move wrote over says `#REF!` there.
+    move(*self, from: Area, col: int, row: int) -> Result[Area, string]
+        val dc = col - from.col1
+        val dr = row - from.row1
+        val to = Area(from.col1 + dc, from.row1 + dr, from.col2 + dc, from.row2 + dr)
+
+        if col < 0 || row < 0 || to.col2 >= MAX_COLS || to.row2 >= MAX_ROWS then return Err("the paste does not fit on the sheet")
+        if dc == 0 && dr == 0 then return Ok(to)
+
+        val how = Moved(from, dc, dr)
+        var out: Map[long, string] = map()
+        val moving = self.keys_in(from)
+        val over = self.keys_in(to)
+
+        for i in 0..<over.len()
+            out.put(over[i], "")
+
+        for i in 0..<moving.len()
+            out.put(moving[i], "")
+
+        // Every other formula that reads the moved cells, or a cell they land on.
+        for (k, slot) in self.cells
+            val c = col_of(k)
+            val r = row_of(k)
+
+            if !from.contains(c, r) && !to.contains(c, r)
+                val t = self.adjusted(slot, how)
+
+                if t != slot.input then out.put(k, t)
+
+        for i in 0..<moving.len()
+            val k = moving[i]
+
+            self.cells.get(k) match
+                Some(slot) -> out.put(key(col_of(k) + dc, row_of(k) + dr), self.adjusted(slot, how))
+                None -> ()
+
+        self.write_all(out)
+        Ok(to)
+    end move
+
+    // A cell's input with its formula's references adjusted -- the input exactly as typed when the
+    // edit leaves the formula as it was.
+    private adjusted(self, slot: Slot, how: Adjust) -> string
+        slot.content match
+            Formula(e) ->
+                val before = formula_text(e)
+                val after = formula_text(adjust(e, self.name, how))
+
+                if after == before then slot.input else "=" + after
+            Constant(_) -> slot.input
+    end adjusted
+
+    // A plan of inputs carried out, skipping the cells it would leave as they are, and settled as one
+    // step.
+    private write_all(*self, out: Map[long, string])
+        for (k, input) in out
+            if input != self.input_at(k)
+                val _ = self.put(k, input)
+
+        self.settle()
+
+    // --- Filling ------------------------------------------------------------------------------------
+
+    // Ctrl-D: the top row of an area copied into the rest of it, or, for a single row, the row above
+    // it copied into it.
+    fill_down(*self, a: Area) -> Result[Area, string]
+        if a.height() == 1
+            if a.row1 == 0 then return Ok(a)
+
+            return self.paste(self.copy(Area(a.col1, a.row1 - 1, a.col2, a.row1 - 1)), a)
+
+        self.paste(self.copy(Area(a.col1, a.row1, a.col2, a.row1)), Area(a.col1, a.row1 + 1, a.col2, a.row2))
+    end fill_down
+
+    // Ctrl-R: the left column of an area copied into the rest of it, or, for a single column, the
+    // column to its left copied into it.
+    fill_right(*self, a: Area) -> Result[Area, string]
+        if a.width() == 1
+            if a.col1 == 0 then return Ok(a)
+
+            return self.paste(self.copy(Area(a.col1 - 1, a.row1, a.col1 - 1, a.row2)), a)
+
+        self.paste(self.copy(Area(a.col1, a.row1, a.col1, a.row2)), Area(a.col1 + 1, a.row1, a.col2, a.row2))
+    end fill_right
+
+    // --- Rows and columns ---------------------------------------------------------------------------
+
+    // `n` empty rows inserted before row `at`, everything below moving down. Refused when it would
+    // push something off the bottom of the sheet.
+    insert_rows(*self, at: int, n: int) -> Result[unit, string] = self.insert(true, at, n)
+
+    insert_cols(*self, at: int, n: int) -> Result[unit, string] = self.insert(false, at, n)
+
+    // Rows `at` to `at + n - 1` deleted, everything below moving up.
+    delete_rows(*self, at: int, n: int) -> Result[unit, string] = self.delete(true, at, n)
+
+    delete_cols(*self, at: int, n: int) -> Result[unit, string] = self.delete(false, at, n)
+
+    private insert(*self, rows: bool, at: int, n: int) -> Result[unit, string]
+        val limit = if rows then MAX_ROWS else MAX_COLS
+        val what = if rows then "rows" else "columns"
+
+        if at < 0 || n <= 0 || at >= limit then return Err(s"there are no such ${what} to insert before")
+        if n > limit - at then return Err(s"inserting ${n} ${what} would push the sheet's last ${what} off it")
+
+        for (k, _) in self.cells
+            val p = if rows then row_of(k) else col_of(k)
+
+            if p >= limit - n then return Err(s"inserting ${n} ${what} would push cells off the edge of the sheet")
+
+        self.restructure(Inserted(rows, at, n))
+        Ok(())
+    end insert
+
+    private delete(*self, rows: bool, at: int, n: int) -> Result[unit, string]
+        val limit = if rows then MAX_ROWS else MAX_COLS
+
+        if at < 0 || n <= 0 || at >= limit then return Err(s"there are no such ${if rows then "rows" else "columns"} to delete")
+
+        self.restructure(Deleted(rows, at, n.min(limit - at)))
+        Ok(())
+    end delete
+
+    // Rows or columns inserted or deleted: every cell past them moved, every formula's references
+    // adjusted, and column widths moved with their columns.
+    private restructure(*self, how: Adjust)
+        var out: Map[long, string] = map()
+        var placed: Buf[(long, string)] = buf()
+
+        for (k, slot) in self.cells
+            val input = self.adjusted(slot, how)
+
+            moved_to(col_of(k), row_of(k), how) match
+                Some((c, r)) ->
+                    val k2 = key(c, r)
+
+                    if k2 != k then out.put(k, "")
+                    if k2 != k || input != slot.input then placed.push((k2, input))
+                None -> out.put(k, "")
+
+        // The cells' new places after every old one is cleared, so that one moving into a place
+        // another left is not cleared after it lands.
+        for i in 0..<placed.len()
+            out.put(placed[i].0, placed[i].1)
+
+        how match
+            Inserted(rows, _, _) -> if !rows then self.move_widths(how)
+            Deleted(rows, _, _) -> if !rows then self.move_widths(how)
+            _ -> ()
+
+        self.write_all(out)
+    end restructure
+
+    private move_widths(*self, how: Adjust)
+        var had: Buf[(int, int)] = buf()
+
+        for (col, w) in self.widths
+            had.push((col, w))
+
+        for i in 0..<had.len()
+            self.put_width(had[i].0, 0)
+
+        for i in 0..<had.len()
+            moved_to(had[i].0, 0, how) match
+                Some((c, _)) -> self.put_width(c, had[i].1)
+                None -> ()
+    end move_widths
+
+    // --- Column widths ------------------------------------------------------------------------------
+
+    // A column's own width, if it has been given one.
+    width(self, col: int) -> Option[int] = self.widths.get(col)
+
+    // A column given a width of its own, as one step.
+    set_width(*self, col: int, w: int)
+        self.put_width(col, w)
+        self.settle()
+
+    // Columns `c1` to `c2` back to the standard width, as one step.
+    reset_widths(*self, c1: int, c2: int)
+        var doomed: Buf[int] = buf()
+
+        for (col, _) in self.widths
+            if col >= c1 && col <= c2 then doomed.push(col)
+
+        for i in 0..<doomed.len()
+            self.put_width(doomed[i], 0)
+
+        self.settle()
+    end reset_widths
+
+    // --- Text for other programs --------------------------------------------------------------------
+
+    // An area as tab-separated text, a line to a row, each ended by a newline, as Excel puts it on the
+    // clipboard: what each cell SHOWS, since a program that is not a spreadsheet can do nothing with
+    // a formula. A whole column or row stops at the last thing stored. A value holding a tab, a line
+    // break or a leading quote is quoted, with its quotes doubled.
+    tsv(self, a: Area) -> string
+        val c = if a.size() > MAX_PASTE then self.clamp(a) else a
+        var sb = str_builder()
+
+        if c.col2 < c.col1 || c.row2 < c.row1 then return ""
+
+        for r in c.row1..c.row2
+            for k in c.col1..c.col2
+                if k > c.col1 then sb.push("\t")
+
+                sb.push(quoted(self.value_at(k, r).display()))
+
+            sb.push("\n")
+
+        sb.finish()
+    end tsv
+
+    // Tab-separated text from another program put into the cells from `col`, `row` on, each field as
+    // if it had been typed -- so `=A1*2` is a formula -- and an empty field emptying its cell. A field
+    // that would be a formula that does not read is kept as text. The answer is the area written.
+    paste_text(*self, text: string, col: int, row: int) -> Result[Area, string]
+        val lines = read_tsv(text)
+        var w = 0
+
+        for i in 0..<lines.len()
+            w = w.max(int(lines[i].len()))
+
+        if lines.len() == 0 || w == 0 then return Err("there is nothing to paste")
+
+        val to = Area(col, row, col + w - 1, row + int(lines.len()) - 1)
+
+        if to.col2 >= MAX_COLS || to.row2 >= MAX_ROWS then return Err("the paste does not fit on the sheet")
+        if to.size() > MAX_PASTE then return Err(s"the paste would write ${to.size()} cells, more than ${MAX_PASTE}")
+
+        for r in 0..<lines.len()
+            val fields = lines[r]
+
+            for c in 0..<w
+                val field = if c < int(fields.len()) then fields[usize(c)] else ""
+                val k = key(col + c, row + int(r))
+
+                self.put(k, field) match
+                    Ok(_) -> ()
+                    Err(_) -> val _ = self.put(k, "'" + field)
+
+        self.settle()
+        Ok(to)
+    end paste_text
+end Sheet
+
+// Where the cell at `col`, `row` goes when rows or columns are inserted or deleted, or nothing if it
+// was deleted. Any other edit leaves it where it is.
+moved_to(col: int, row: int, how: Adjust) -> Option[(int, int)]
+    how match
+        Inserted(rows, at, n) ->
+            val p = if rows then row else col
+
+            if p < at then return Some((col, row))
+
+            Some(if rows then (col, row + n) else (col + n, row))
+        Deleted(rows, at, n) ->
+            val p = if rows then row else col
+
+            if p < at then return Some((col, row))
+            if p < at + n then return None
+
+            Some(if rows then (col, row - n) else (col - n, row))
+        _ -> Some((col, row))
+end moved_to
+
+// A field for tab-separated text: quoted when it holds what would end it.
+private quoted(s: string) -> string
+    if !(s.contains("\t") || s.contains("\n") || s.contains("\r") || s.starts_with("\"")) then return s
+
+    var sb = str_builder()
+
+    sb.push("\"")
+
+    for ch in s.chars
+        if ch == '"' then sb.push("\"\"") else sb.push_char(ch)
+
+    sb.push("\"")
+    sb.finish()
+end quoted
+
+// Tab-separated text read into lines of fields. A line ends at `\n`, `\r\n` or `\r`; a field that
+// starts with `"` runs to the matching quote, tabs and line breaks included, with `""` for a quote. A
+// last line left empty by a final line break is no line.
+read_tsv(text: string) -> Buf[Buf[string]]
+    var lines: Buf[Buf[string]] = buf()
+    var fields: Buf[string] = buf()
+    var sb = str_builder()
+    val b = text.bytes
+    var i: usize = 0
+    var quoting = false
+    var started = false
+
+    while i < b.len
+        val c = b[i]
+
+        if quoting
+            if c == u8('"')
+                if i + 1 < b.len && b[i + 1] == u8('"')
+                    sb.push("\"")
+                    i += 1
+                else
+                    quoting = false
+            else
+                sb.bytes.push(c)
+        elif c == u8('"') && !started
+            quoting = true
+            started = true
+        elif c == u8('\t')
+            fields.push(sb.finish())
+            sb = str_builder()
+            started = false
+        elif c == u8('\n') || c == u8('\r')
+            if c == u8('\r') && i + 1 < b.len && b[i + 1] == u8('\n') then i += 1
+
+            fields.push(sb.finish())
+            lines.push(fields)
+            fields = buf()
+            sb = str_builder()
+            started = false
+        else
+            sb.bytes.push(c)
+            started = true
+
+        i += 1
+
+    val last = sb.finish()
+
+    if started || last.len > 0 || fields.len() > 0
+        fields.push(last)
+        lines.push(fields)
+
+    lines
+end read_tsv

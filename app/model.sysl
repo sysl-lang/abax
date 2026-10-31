@@ -2,7 +2,7 @@
 // where the grid is scrolled to, how wide each column is, and the cell being typed into. Every key and
 // click the grid receives lands here as a call, so all of it is tested without SDL.
 
-import sh.sysl.abax.{Sheet, Value, Area, Ref, sheet, at, area_of, column_name, parse_ref, read_ref, general,
+import sh.sysl.abax.{Sheet, Value, Area, Ref, Clip, sheet, at, area_of, column_name, parse_area, general,
                      col_of, row_of, MAX_COLS, MAX_ROWS}
 import sh.sysl.ui.{Signal, signal, Press, Key, Selection, apply}
 import sysl.buf.{Buf, buf}
@@ -35,8 +35,11 @@ struct Model
     room_w: int
     room_h: int
 
-    // Columns dragged away from `COL_W`.
-    widths: Map[int, int]
+    // What the last copy or cut took, the text it put on the system clipboard, and the area drawn
+    // with a dashed outline until a paste of a cut, an edit, or Escape.
+    clip: Option[Clip]
+    clip_text: string
+    marked: Option[Area]
 
     // The cell being typed into: its text and where the caret is. `entering` is a cell begun by
     // typing over it, where an arrow key finishes the entry and moves; a cell opened with F2 or a
@@ -50,9 +53,11 @@ struct Model
     message: string
     alert: bool
 
-    // The column whose right edge is being dragged, or -1, and where that column starts.
+    // The column whose right edge is being dragged, or -1, where that column starts, and the width
+    // the drag has made it so far -- given to the sheet, as one step, when the drag ends.
     resizing: int
     resize_x: int
+    drag_w: int
 
     // Whether the press the grid is about to see was the second of a double click, and whether the
     // grid has the keyboard. Both are told by the window's events, which the grid cannot see.
@@ -89,7 +94,8 @@ struct Model
             None -> self.sheet.input(a)
     end input
 
-    width(self, col: int) -> int = self.widths.get(col).unwrap_or(COL_W)
+    width(self, col: int) -> int =
+        if col == self.resizing && self.drag_w > 0 then self.drag_w else self.sheet.width(col).unwrap_or(COL_W)
 
     // How many whole rows the cells have room for, at least one.
     rows_shown(self) -> int = (self.room_h / ROW_H).max(1)
@@ -272,32 +278,31 @@ struct Model
         self.sync()
 
     // A column's right edge dragged to make it `w` wide.
-    set_width(*self, col: int, w: int) = self.widths.put(col, w.max(MIN_COL_W))
+    set_width(*self, col: int, w: int) = self.sheet.set_width(col, w.max(MIN_COL_W))
+
+    // The edge being dragged has reached `w`; the sheet hears of it when the drag ends.
+    drag_width(*self, w: int) = self.drag_w = w.max(MIN_COL_W)
+
+    end_resize(*self)
+        if self.resizing >= 0 && self.drag_w > 0 then self.sheet.set_width(self.resizing, self.drag_w)
+
+        self.resizing = -1
+        self.drag_w = 0
 
     // Every selected column back to the standard width.
     standard_width(*self)
         val a = self.selection()
 
-        if a.width() == MAX_COLS
-            self.widths.clear()
-            return
-
-        for k in a.col1..a.col2
-            val _ = self.widths.remove(k)
-    end standard_width
+        self.sheet.reset_widths(a.col1, a.col2)
 
     // The name box: a cell or a range typed into it, selected.
     jump_to(*self, text: string) -> bool
-        val parts = split(text.trim(), ":")
-        val first = if parts.len == 1 then parse_ref(parts[0]) else end_ref(parts[0])
-        val last = if parts.len == 2 then end_ref(parts[1]) else first
-
-        if parts.len > 2 || first.is_none() || last.is_none()
-            self.say(s"'${text}' is not a cell or a range", true)
-            self.sync()
-            return false
-
-        val a = area_of(first.unwrap(), last.unwrap())
+        val a = parse_area(text) match
+            Some(got) -> got
+            None ->
+                self.say(s"'${text}' is not a cell or a range", true)
+                self.sync()
+                return false
 
         self.go(a.col1, a.row1)
         self.extend(a.col2, a.row2)
@@ -330,6 +335,8 @@ struct Model
             Key.Backspace -> self.clear()
             Key.Escape ->
                 self.message = ""
+                self.clip = None
+                self.marked = None
                 self.sync()
     end move_key
 
@@ -385,7 +392,7 @@ struct Model
                 self.editing = false
                 self.message = ""
                 self.alert = false
-                self.sync()
+                self.edited()
                 true
             Err(e) ->
                 self.say(e, true)
@@ -403,7 +410,7 @@ struct Model
             Ok(_) ->
                 self.editing = false
                 self.message = ""
-                self.sync()
+                self.edited()
                 true
             Err(e) ->
                 self.say(e, true)
@@ -412,23 +419,130 @@ struct Model
 
     // Empty every selected cell.
     clear(*self)
-        val a = self.selection()
-        var doomed: Buf[long] = buf()
-
-        for (k, _) in self.sheet.cells
-            if a.contains(col_of(k), row_of(k)) then doomed.push(k)
-
-        for i in 0..<doomed.len()
-            val _ = self.sheet.set_at(col_of(doomed[i]), row_of(doomed[i]), "")
-
+        self.sheet.clear(self.selection())
         self.message = ""
+        self.edited()
+
+    // --- Editing ------------------------------------------------------------------------------------
+
+    // Ctrl-Z: the last edit taken back.
+    undo(*self)
+        if self.sheet.undo()
+            self.message = ""
+            self.edited()
+        else
+            self.say("there is nothing to undo")
+
+    // Ctrl-Y or Ctrl-Shift-Z: the last edit undone made again.
+    redo(*self)
+        if self.sheet.redo()
+            self.message = ""
+            self.edited()
+        else
+            self.say("there is nothing to redo")
+
+    // Ctrl-C: the selection taken to be pasted, outlined, and answered as the text the system
+    // clipboard is given -- what the cells show, tab-separated, for any other program.
+    copy(*self) -> string = self.take(self.sheet.copy(self.selection()))
+
+    // Ctrl-X: the selection taken to be moved by the next paste.
+    cut(*self) -> string = self.take(self.sheet.cut(self.selection()))
+
+    private take(*self, c: Clip) -> string
+        self.clip = Some(c)
+        self.clip_text = self.sheet.tsv(c.area)
+        self.marked = Some(c.area)
+        self.message = ""
+        self.clip_text
+    end take
+
+    // Ctrl-V, given what the system clipboard holds. While that is still the text the last copy or
+    // cut put there, the cells themselves are pasted, formulas and all; anything else came from
+    // another program and is pasted as tab-separated inputs. A pasted cut moves its cells, and is
+    // then used up.
+    paste(*self, outside: string)
+        val ours = self.clip match
+            Some(c) -> if outside == self.clip_text || outside.len == 0 then Some(c) else None
+            None -> None
+
+        val done = ours match
+            Some(c) -> self.sheet.paste(c, self.selection())
+            None ->
+                if outside.len == 0
+                    self.say("there is nothing to paste")
+                    return
+
+                self.sheet.paste_text(outside, self.col, self.row)
+
+        done match
+            Ok(a) ->
+                val was_cut = ours match
+                    Some(c) -> c.cut
+                    None -> false
+
+                if was_cut then self.clip = None
+
+                self.select(a)
+                self.message = ""
+                self.marked = if was_cut || ours.is_none() then None else self.marked
+                self.sync()
+            Err(e) -> self.say(e, true)
+    end paste
+
+    // Ctrl-D and Ctrl-R.
+    fill_down(*self) = self.filled_by(self.sheet.fill_down(self.selection()))
+
+    fill_right(*self) = self.filled_by(self.sheet.fill_right(self.selection()))
+
+    private filled_by(*self, r: Result[Area, string])
+        r match
+            Ok(_) ->
+                self.message = ""
+                self.edited()
+            Err(e) -> self.say(e, true)
+
+    // Insert ▸ Row above and Column left: as many as are selected, before the selection.
+    insert_rows(*self) = self.structural(self.sheet.insert_rows(self.selection().row1, self.selection().height()))
+
+    insert_cols(*self) = self.structural(self.sheet.insert_cols(self.selection().col1, self.selection().width()))
+
+    // Insert ▸ Delete row and Delete column: the selected rows or columns, closed up.
+    delete_rows(*self) = self.structural(self.sheet.delete_rows(self.selection().row1, self.selection().height()))
+
+    delete_cols(*self) = self.structural(self.sheet.delete_cols(self.selection().col1, self.selection().width()))
+
+    private structural(*self, r: Result[unit, string])
+        r match
+            Ok(_) ->
+                self.message = ""
+                self.edited()
+            Err(e) -> self.say(e, true)
+
+    // An area selected, its first cell active.
+    select(*self, a: Area)
+        self.go(a.col1, a.row1)
+        self.extend(a.col2, a.row2)
+        self.follow(a.col1, a.row1)
+
+    // After any edit the outline of a copy or a cut is gone, and a cut is no longer there to move,
+    // as Excel has it: the cells it named may not be what they were.
+    private edited(*self)
+        self.marked = None
+
+        val cut = self.clip match
+            Some(c) -> c.cut
+            None -> false
+
+        if cut then self.clip = None
+
         self.sync()
-    end clear
+    end edited
 
     // A fresh, empty sheet.
     renew(*self)
         self.sheet = sheet("Sheet1")
-        self.widths.clear()
+        self.clip = None
+        self.marked = None
         self.editing = false
         self.left = 0
         self.top = 0
@@ -449,16 +563,10 @@ end Model
 // Is this a cell of the sheet at all?
 inside(col: int, row: int) -> bool = col >= 0 && col < MAX_COLS && row >= 0 && row < MAX_ROWS
 
-// One end of a range in the name box: a cell, or only a column's letters or a row's number.
-private end_ref(text: string) -> Option[Ref] =
-    read_ref(text.trim().bytes, 0) match
-        Some((r, n)) -> if n == text.trim().len then Some(r) else None
-        None -> None
-
 // A window's worth of state over an empty sheet.
 model() -> &Model
-    val m: &Model = Model(sheet("Sheet1"), 0, 0, 0, 0, 0, 0, 1000, 600, map(), false, false, "",
-                          Selection(0, 0), "", false, -1, 0, false, false, 0, 0, signal("A1"),
+    val m: &Model = Model(sheet("Sheet1"), 0, 0, 0, 0, 0, 0, 1000, 600, None, "", None, false, false, "",
+                          Selection(0, 0), "", false, -1, 0, 0, false, false, 0, 0, signal("A1"),
                           signal(""), signal(-1))
     m
 end model
@@ -487,6 +595,7 @@ demo(m: &Model)
             if rows[r][c].len > 0 then m.sheet.set_at(int(c), int(r), rows[r][c]).unwrap()
 
     m.set_width(0, 130)
+    m.sheet.forget_history()
     m.go(4, 8)
 end demo
 

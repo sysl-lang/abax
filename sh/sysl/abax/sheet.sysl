@@ -43,6 +43,11 @@ struct Sheet
     // How many times a formula has been worked out, over the sheet's life: what a test of "exactly
     // what depends on it" counts, and what a measurement of recalculation reads.
     evaluations: long
+    // Columns set to a width of their own, in whatever unit the program showing the sheet draws in.
+    widths: Map[int, int]
+    // The cells written since the last recalculation, and the undo and redo history.
+    dirty: Buf[long]
+    journal: Journal
 
     // --- Reading ------------------------------------------------------------------------------------
 
@@ -127,9 +132,24 @@ struct Sheet
     set_at(*self, col: int, row: int, input: string) -> Result[unit, string]
         if col < 0 || col >= MAX_COLS || row < 0 || row >= MAX_ROWS then return Err("the cell is outside the sheet")
 
-        val k = key(col, row)
+        self.put(key(col, row), input)?
+        self.settle()
+        Ok(())
+    end set_at
+
+    // What was typed into the cell `k`; "" for an empty one.
+    input_at(self, k: long) -> string
+        self.cells.get(k) match
+            Some(slot) -> slot.input
+            None -> ""
+
+    // The cell `k` given `input`, with the graph kept right but nothing recalculated: an edit of many
+    // cells puts each of them and then settles once. Whatever the cell held first in this step is
+    // noted, so that the step can be undone.
+    private[abax] put(*self, k: long, input: string) -> Result[unit, string]
         val content = if input.len == 0 then Constant(Empty) else read_input(input)?
 
+        self.journal.note(k, self.input_at(k))
         self.unlink(k)
 
         content match
@@ -142,12 +162,33 @@ struct Sheet
                 self.link(k, reads)
 
         if input.len > 0
-            self.last_col = self.last_col.max(col)
-            self.last_row = self.last_row.max(row)
+            self.last_col = self.last_col.max(col_of(k))
+            self.last_row = self.last_row.max(row_of(k))
 
-        self.recalculate_from(k)
+        self.dirty.push(k)
         Ok(())
-    end set_at
+    end put
+
+    // A column's own width given, or taken away with 0, noted for undoing as a cell is.
+    private[abax] put_width(*self, col: int, w: int)
+        self.journal.note_width(col, self.widths.get(col).unwrap_or(0))
+
+        if w <= 0 then val _ = self.widths.remove(col) else self.widths.put(col, w)
+
+    // The end of an edit: everything the cells written depend on recalculated, and -- unless this is
+    // an undo or a redo being replayed -- what changed kept as one step of the history.
+    private[abax] settle(*self)
+        val seeds = self.dirty
+
+        self.dirty = buf()
+        self.recalculate_from(seeds)
+
+        val step = self.journal.close(self.cells, self.widths)
+
+        if step.cells.len() > 0 || step.widths.len() > 0
+            self.journal.undo.push(step)
+            self.journal.redo.clear()
+    end settle
 
     // Every formula on the sheet worked out again, in dependency order.
     recalculate(*self)
@@ -228,14 +269,16 @@ struct Sheet
         self.watches = kept
     end unlink
 
-    // The cell `k` changed: it and everything that depends on it, however indirectly, recalculated.
-    private recalculate_from(*self, k: long)
+    // Some cells changed: they and everything that depends on them, however indirectly, recalculated.
+    private recalculate_from(*self, changed: Buf[long])
         var seen: Map[long, bool] = map()
         var todo: Buf[long] = buf()
         var all: Buf[long] = buf()
 
-        seen.put(k, true)
-        todo.push(k)
+        for i in 0..<changed.len()
+            if !seen.has(changed[i])
+                seen.put(changed[i], true)
+                todo.push(changed[i])
 
         while todo.len() > 0
             val at = todo.pop().unwrap()
@@ -296,7 +339,7 @@ struct Sheet
 end Sheet
 
 // An empty sheet called `name`.
-sheet(name: string) -> Sheet = Sheet(name, map(), map(), buf(), -1, -1, 0)
+sheet(name: string) -> Sheet = Sheet(name, map(), map(), buf(), -1, -1, 0, map(), buf(), journal())
 
 // What some typed input means: a formula after `=`, text after `'`, else a number, a logical, an error
 // code, or text.

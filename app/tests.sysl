@@ -646,3 +646,189 @@ name_box_keys()
     assert(m.alert)
     assert(m.selection() == Area(2, 2, 3, 4))
     assert_eq(m.name.read(), "C3")
+
+// --- Editing ---------------------------------------------------------------------------------------
+
+// A sheet with A1 = 2, B1 = =A1*10, A2 = 3, B2 = =A2*10.
+private two_rows() -> &Model
+    val m = model()
+
+    m.sheet.set("A1", "2").unwrap()
+    m.sheet.set("B1", "=A1*10").unwrap()
+    m.sheet.set("A2", "3").unwrap()
+    m.sheet.set("B2", "=A2*10").unwrap()
+    m.sheet.forget_history()
+    m
+end two_rows
+
+// Is the outline of a copy or a cut drawn at this rectangle?
+private dashed(c: *Recorder, at: string) -> bool
+    for k in 0..<c.ops.len()
+        if c.ops[k].starts_with("stroke " + at + " ") && c.ops[k].ends_with(" d4") then return true
+
+    false
+
+@test("copy then paste writes the cells with their formulas moved, and selects what was pasted")
+copy_paste()
+    val m = two_rows()
+
+    m.jump_to("A1:B2")
+
+    val text = m.copy()
+
+    assert_eq(text, "2\t20\n3\t30\n")
+    assert(m.marked == Some(Area(0, 0, 1, 1)))
+    m.go(3, 4)
+    m.paste(text)
+    assert_eq(m.sheet.formula("E5").unwrap_or(""), "=D5*10")
+    assert_eq(m.sheet.display("E6"), "30")
+    assert(m.selection() == Area(3, 4, 4, 5))
+    // A copy can be pasted again, and its outline stays.
+    assert(m.marked == Some(Area(0, 0, 1, 1)))
+    m.go(3, 9)
+    m.paste(text)
+    assert_eq(m.sheet.formula("E10").unwrap_or(""), "=D10*10")
+
+@test("undo after a paste takes the whole paste back, and redo makes it again")
+undo_paste()
+    val m = two_rows()
+
+    m.jump_to("A1:B2")
+
+    val text = m.copy()
+
+    m.go(0, 5)
+    m.paste(text)
+    assert_eq(m.sheet.input("A7"), "3")
+    m.undo()
+    assert_eq(m.sheet.input("A6"), "")
+    assert_eq(m.sheet.input("A7"), "")
+    assert_eq(m.sheet.input("A1"), "2")
+    m.redo()
+    assert_eq(m.sheet.input("A7"), "3")
+    m.redo()
+    assert_eq(m.message, "there is nothing to redo")
+
+@test("a cut is outlined until Escape, and after Escape the paste is the clipboard's text, not a move")
+cut_escape()
+    val m = two_rows()
+    var c = recorder()
+
+    m.jump_to("A1:B2")
+
+    val text = m.cut()
+
+    frame(m, &c)
+    assert(dashed(&c, "69,21 161x45"))
+    m.key(press(Key.Escape))
+    frame(m, &c)
+    assert(m.marked.is_none())
+    assert(!dashed(&c, "69,21 161x45"))
+
+    m.go(3, 0)
+    m.paste(text)
+    assert_eq(m.sheet.input("A1"), "2")
+    assert_eq(m.sheet.input("E1"), "20")
+    assert(m.sheet.formula("E1").is_none())
+
+@test("a cut pasted moves the cells, references follow, and the cut is then used up")
+cut_paste_moves()
+    val m = two_rows()
+
+    m.sheet.set("D1", "=SUM(A1:B2)").unwrap()
+    m.jump_to("A1:A2")
+
+    val text = m.cut()
+
+    m.go(0, 9)
+    m.paste(text)
+    assert_eq(m.sheet.input("A1"), "")
+    assert_eq(m.sheet.input("A10"), "2")
+    assert_eq(m.sheet.formula("B1").unwrap_or(""), "=A10*10")
+    // The range only partly moved stays where it was, as Excel keeps it.
+    assert_eq(m.sheet.formula("D1").unwrap_or(""), "=SUM(A1:B2)")
+    assert_eq(m.sheet.display("D1"), "50")
+    assert(m.marked.is_none())
+    assert(m.clip.is_none())
+    assert(m.selection() == Area(0, 9, 0, 10))
+
+    // One step: undone, everything is back where it was.
+    m.undo()
+    assert_eq(m.sheet.input("A1"), "2")
+    assert_eq(m.sheet.formula("B1").unwrap_or(""), "=A1*10")
+
+@test("an edit made after a cut lets the cut go; text from another program pastes as typed inputs")
+edit_ends_cut()
+    val m = two_rows()
+
+    m.jump_to("A1")
+
+    val _ = m.cut()
+
+    m.go(5, 5)
+    m.begin("x", true)
+    assert(m.commit())
+    assert(m.marked.is_none())
+    assert(m.clip.is_none())
+
+    m.go(6, 0)
+    m.paste("1\t=G1+1\r\nword")
+    assert_eq(m.sheet.display("H1"), "2")
+    assert_eq(m.sheet.input("G2"), "word")
+    assert(m.selection() == Area(6, 0, 7, 1))
+
+    m.paste("")
+    assert_eq(m.message, "there is nothing to paste")
+
+@test("fill down, fill right, and insert and delete rows and columns act on the selection")
+fill_and_structure()
+    val m = two_rows()
+
+    m.jump_to("B2:B4")
+    m.fill_down()
+    assert_eq(m.sheet.formula("B4").unwrap_or(""), "=A4*10")
+
+    m.jump_to("A1:C1")
+    m.fill_right()
+    assert_eq(m.sheet.input("B1"), "2")
+
+    m.jump_to("A2:A3")
+    m.insert_rows()
+    assert_eq(m.sheet.input("A4"), "3")
+    assert_eq(m.sheet.formula("B4").unwrap_or(""), "=A4*10")
+
+    m.jump_to("A1")
+    m.delete_cols()
+    assert_eq(m.sheet.formula("A4").unwrap_or(""), "=#REF!*10")
+
+    m.jump_to("2:3")
+    m.delete_rows()
+    assert_eq(m.sheet.formula("A2").unwrap_or(""), "=#REF!*10")
+
+    m.undo()
+    m.undo()
+    assert_eq(m.sheet.formula("B4").unwrap_or(""), "=A4*10")
+
+    // Every row selected cannot have rows inserted before it while anything is on the sheet.
+    m.select_all()
+    m.insert_rows()
+    assert(m.alert)
+
+@test("a column's width dragged is one step of the undo history, and undone it is standard again")
+width_undo()
+    val m = model()
+    var c = recorder()
+
+    frame(m, &c)
+    c.point(150, 10, true)
+    frame(m, &c)
+    c.point(200, 10, true)
+    frame(m, &c)
+    c.point(260, 10, true)
+    frame(m, &c)
+    c.point(260, 10, false)
+    frame(m, &c)
+    assert_eq(m.width(0), 190)
+    assert(m.sheet.journal.undo.len() == 1)
+    m.undo()
+    assert_eq(m.width(0), COL_W)
