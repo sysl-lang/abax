@@ -167,8 +167,7 @@ end shortcut
 
 // Copy, cut and paste through the system clipboard, which carries what the cells show as
 // tab-separated text, for other programs; the cells themselves stay in the model, for abax.
-copy_out(m: &Model)
-    val _ = set_clipboard_text(m.copy())
+copy_out(m: &Model) -> unit = set_clipboard_text(m.copy())
 
 cut_out(m: &Model)
     val _ = set_clipboard_text(m.cut())
