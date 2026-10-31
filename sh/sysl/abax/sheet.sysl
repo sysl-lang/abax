@@ -40,6 +40,9 @@ struct Sheet
     // The furthest column and row anything has been stored in, which bounds a walk of a whole column.
     last_col: int
     last_row: int
+    // How many times a formula has been worked out, over the sheet's life: what a test of "exactly
+    // what depends on it" counts, and what a measurement of recalculation reads.
+    evaluations: long
 
     // --- Reading ------------------------------------------------------------------------------------
 
@@ -91,8 +94,8 @@ struct Sheet
         if c.col2 < c.col1 || c.row2 < c.row1 then return out
 
         if c.size() <= long(self.cells.len())
-            for r in c.row1..c.row2 + 1
-                for k in c.col1..c.col2 + 1
+            for r in c.row1..c.row2
+                for k in c.col1..c.col2
                     self.cells.get(key(k, r)) match
                         Some(slot) -> out.push(slot.value)
                         None -> ()
@@ -284,6 +287,8 @@ struct Sheet
                             Formula(e) ->
                                 val v = if cyclic then Error(Circular) else evaluate(*self, e)
 
+                                self.evaluations += 1
+
                                 self.cells.put(at, Slot(slot.input, slot.content, v, slot.reads))
                             Constant(_) -> ()
                     None -> ()
@@ -291,7 +296,7 @@ struct Sheet
 end Sheet
 
 // An empty sheet called `name`.
-sheet(name: string) -> Sheet = Sheet(name, map(), map(), buf(), -1, -1)
+sheet(name: string) -> Sheet = Sheet(name, map(), map(), buf(), -1, -1, 0)
 
 // What some typed input means: a formula after `=`, text after `'`, else a number, a logical, an error
 // code, or text.

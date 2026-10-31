@@ -1,12 +1,336 @@
 module sh.sysl.abax
 @tests
 
-@test("a formula reads the cells it names")
-sheet_basics()
+// --- Input ------------------------------------------------------------------------------------------
+
+@test("typed input becomes a number, a logical, an error, text, or a formula")
+inputs()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "42").unwrap()
+    s.set("A2", " 2.50 ").unwrap()
+    s.set("A3", "true").unwrap()
+    s.set("A4", "#n/a").unwrap()
+    s.set("A5", "hello").unwrap()
+    s.set("A6", "'123").unwrap()
+    s.set("A7", "=1+1").unwrap()
+    s.set("A8", "=").unwrap()
+    s.set("A9", "25%").unwrap()
+    assert(s.value("A1") == Number(42.0))
+    assert(s.value("A2") == Number(2.5))
+    assert(s.value("A3") == Bool(true))
+    assert(s.value("A4") == Error(NotAvailable))
+    assert(s.value("A5") == Text("hello"))
+    assert(s.value("A6") == Text("123"))
+    assert(s.value("A7") == Number(2.0))
+    assert(s.value("A8") == Text("="))
+    assert(s.value("A9") == Number(0.25))
+    assert_eq(s.input("A2"), " 2.50 ")
+    assert_eq(s.input("A6"), "'123")
+    assert_eq(s.input("A7"), "=1+1")
+    assert_eq(s.display("A3"), "TRUE")
+    assert_eq(s.input("Z99"), "")
+    assert(s.value("Z99") == Empty)
+
+@test("a formula cell gives back its formula in canonical form, and a constant gives none")
+formulas()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "=sum( b1:b3 )*2").unwrap()
+    s.set("A2", "7").unwrap()
+    assert(s.formula("A1") == Some("=SUM(B1:B3)*2"))
+    assert(s.formula("A2").is_none())
+    assert(s.formula("A3").is_none())
+    assert(s.formula("nonsense").is_none())
+
+@test("a formula that does not parse is refused and the cell keeps what it had")
+refused_input()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "5").unwrap()
+    assert(s.set("A1", "=1+") == Err("the formula ends where an operand was expected"))
+    assert(s.value("A1") == Number(5.0))
+    assert_eq(s.input("A1"), "5")
+    assert(s.set("A0", "1") == Err("'A0' is not a cell address"))
+    assert(s.set("XFE1", "1") == Err("'XFE1' is not a cell address"))
+    assert(s.set_at(MAX_COLS, 0, "1") == Err("the cell is outside the sheet"))
+    assert(s.set_at(0, MAX_ROWS, "1") == Err("the cell is outside the sheet"))
+    assert(s.set_at(-1, 0, "1") == Err("the cell is outside the sheet"))
+    assert(s.value("not an address") == Error(BadRef))
+
+@test("the sheet's far corner holds a value like any other cell")
+far_corner()
+    var s = sheet("Sheet1")
+
+    s.set("XFD1048576", "9").unwrap()
+    s.set("A1", "=XFD1048576*2").unwrap()
+    assert_eq(s.display("A1"), "18")
+    s.set_at(MAX_COLS - 1, MAX_ROWS - 1, "10").unwrap()
+    assert_eq(s.display("A1"), "20")
+
+@test("emptying a cell removes it from the store, and what read it sees nothing")
+clearing()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "3").unwrap()
+    s.set("B1", "=A1+1").unwrap()
+    assert_eq(s.count(), 2)
+    s.set("A1", "").unwrap()
+    assert_eq(s.count(), 1)
+    assert_eq(s.display("B1"), "1")
+    assert_eq(s.input("A1"), "")
+
+// --- Recalculation ----------------------------------------------------------------------------------
+
+@test("a change recalculates what depends on it, through a chain")
+chain()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "1").unwrap()
+    s.set("A2", "=A1+1").unwrap()
+    s.set("A3", "=A2+1").unwrap()
+    s.set("A4", "=A3+1").unwrap()
+    assert_eq(s.display("A4"), "4")
+    s.set("A1", "10").unwrap()
+    assert_eq(s.display("A2"), "11")
+    assert_eq(s.display("A3"), "12")
+    assert_eq(s.display("A4"), "13")
+
+@test("a formula entered before the cells it reads is worked out when they arrive")
+forward_references()
+    var s = sheet("Sheet1")
+
+    s.set("C1", "=A1*B1").unwrap()
+    assert_eq(s.display("C1"), "0")
+    s.set("A1", "6").unwrap()
+    s.set("B1", "7").unwrap()
+    assert_eq(s.display("C1"), "42")
+
+@test("a diamond is recalculated in dependency order, each cell once")
+diamond()
+    var s = sheet("Sheet1")
+
+    // D1 reads B1 and C1, which both read A1; D1 must come after both, or it reads a stale one.
+    s.set("A1", "1").unwrap()
+    s.set("B1", "=A1+1").unwrap()
+    s.set("C1", "=B1*A1").unwrap()
+    s.set("D1", "=B1+C1+A1").unwrap()
+    assert_eq(s.display("D1"), "5")
+
+    val before = s.evaluations
+
+    s.set("A1", "3").unwrap()
+    assert_eq(s.display("B1"), "4")
+    assert_eq(s.display("C1"), "12")
+    assert_eq(s.display("D1"), "19")
+    assert_eq(s.evaluations - before, 3)
+
+@test("a change recalculates exactly what depends on it and nothing else")
+exactly_the_dependents()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "1").unwrap()
+    s.set("B1", "2").unwrap()
+    s.set("A2", "=A1*2").unwrap()
+    s.set("B2", "=B1*2").unwrap()
+    s.set("C2", "=SUM(B:B)").unwrap()
+
+    val before = s.evaluations
+
+    s.set("A1", "5").unwrap()
+    assert_eq(s.evaluations - before, 1)
+
+    val mid = s.evaluations
+
+    // B1 is read by B2 directly and by C2 through the whole column, and C2 also reads B2.
+    s.set("B1", "3").unwrap()
+    assert_eq(s.evaluations - mid, 2)
+    assert_eq(s.display("C2"), "9")
+
+    val last = s.evaluations
+
+    s.set("Z9", "1").unwrap()
+    assert_eq(s.evaluations - last, 0)
+
+@test("a range reaches its formula when any cell inside it changes")
+ranges_recalculate()
+    var s = sheet("Sheet1")
+
+    s.set("A10", "=SUM(A1:A3)").unwrap()
+    s.set("B10", "=COUNTA(A:A)").unwrap()
+    s.set("C10", "=SUM(2:2)").unwrap()
+    s.set("A2", "5").unwrap()
+    assert_eq(s.display("A10"), "5")
+    assert_eq(s.display("B10"), "2")
+    assert_eq(s.display("C10"), "5")
+    s.set("A4", "100").unwrap()
+    assert_eq(s.display("A10"), "5")
+    assert_eq(s.display("B10"), "3")
+    s.set("Q2", "1").unwrap()
+    assert_eq(s.display("C10"), "6")
+
+@test("a replaced formula stops being recalculated for the cells it no longer reads")
+replaced_precedents()
+    var s = sheet("Sheet1")
+
+    s.set("B1", "=A1").unwrap()
+    s.set("B1", "=C1").unwrap()
+
+    val before = s.evaluations
+
+    s.set("A1", "1").unwrap()
+    assert_eq(s.evaluations - before, 0)
+    s.set("C1", "2").unwrap()
+    assert_eq(s.display("B1"), "2")
+
+    s.set("B2", "=SUM(A1:A9)").unwrap()
+    s.set("B2", "5").unwrap()
+
+    val after = s.evaluations
+
+    s.set("A3", "1").unwrap()
+    assert_eq(s.evaluations - after, 0)
+
+@test("a whole-column sum on a sheet with a cell at the bottom row walks only the stored cells")
+whole_column()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "1").unwrap()
+    s.set("A1048576", "2").unwrap()
+    s.set("B1", "=SUM(A:A)").unwrap()
+    s.set("B2", "=COUNT(A:A)+COUNTA(A:A)").unwrap()
+    s.set("B3", "=COUNTBLANK(A:A)").unwrap()
+    assert_eq(s.display("B1"), "3")
+    assert_eq(s.display("B2"), "4")
+    assert_eq(s.display("B3"), "1048574")
+    s.set("A500000", "4").unwrap()
+    assert_eq(s.display("B1"), "7")
+
+@test("functions over ranges outside anything stored see empty cells")
+ranges_beyond_the_store()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "=CONCAT(D1:D3)").unwrap()
+    s.set("A2", "=VLOOKUP(1,D1:E3,2)").unwrap()
+    s.set("A3", "=MATCH(1,D:D,0)").unwrap()
+    s.set("A4", "=SUM(F5:G9)").unwrap()
+    assert(s.value("A1") == Text(""))
+    assert_eq(s.display("A2"), "#N/A")
+    assert_eq(s.display("A3"), "#N/A")
+    assert_eq(s.display("A4"), "0")
+
+// --- Cycles -----------------------------------------------------------------------------------------
+
+@test("a cell that reads itself is a circular reference, not a hang")
+cycle_of_one()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "=A1+1").unwrap()
+    assert(s.value("A1") == Error(Circular))
+    s.set("B1", "=SUM(B1:B3)").unwrap()
+    assert(s.value("B1") == Error(Circular))
+
+@test("every cell around a loop of three is a circular reference, and what reads the loop sees it")
+cycle_of_three()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "=C1+1").unwrap()
+    s.set("B1", "=A1+1").unwrap()
+    s.set("D1", "=B1*2").unwrap()
+    s.set("E1", "5").unwrap()
+    s.set("C1", "=B1+E1").unwrap()
+    assert(s.value("A1") == Error(Circular))
+    assert(s.value("B1") == Error(Circular))
+    assert(s.value("C1") == Error(Circular))
+    // D1 is downstream of the loop, not on it: the error reaches it as any error would.
+    assert(s.value("D1") == Error(Circular))
+
+    // Changing a cell the loop reads recalculates it, and it is still a loop.
+    s.set("E1", "6").unwrap()
+    assert(s.value("A1") == Error(Circular))
+
+@test("breaking a loop recalculates every cell that was on it")
+cycle_broken()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "=C1+1").unwrap()
+    s.set("B1", "=A1+1").unwrap()
+    s.set("C1", "=B1+1").unwrap()
+    s.set("D1", "=C1*10").unwrap()
+    assert(s.value("B1") == Error(Circular))
+    s.set("C1", "100").unwrap()
+    assert_eq(s.display("A1"), "101")
+    assert_eq(s.display("B1"), "102")
+    assert_eq(s.display("C1"), "100")
+    assert_eq(s.display("D1"), "1000")
+
+@test("a self-reference broken by a new formula is worked out again")
+self_reference_broken()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "=A1").unwrap()
+    assert(s.value("A1") == Error(Circular))
+    s.set("A1", "=2+2").unwrap()
+    assert_eq(s.display("A1"), "4")
+
+@test("two loops joined by a cell between them are each circular, and the cell between too")
+two_loops()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "=B1").unwrap()
+    s.set("B1", "=A1").unwrap()
+    s.set("C1", "=A1").unwrap()
+    s.set("D1", "=C1+E1").unwrap()
+    s.set("E1", "=D1").unwrap()
+    assert(s.value("A1") == Error(Circular))
+    assert(s.value("C1") == Error(Circular))
+    assert(s.value("D1") == Error(Circular))
+    assert(s.value("E1") == Error(Circular))
+
+@test("a long chain recalculates without running out of anything")
+long_chain()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "1").unwrap()
+
+    for r in 2..2000
+        s.set_at(0, r - 1, s"=A${r - 1}+1").unwrap()
+
+    assert_eq(s.display("A2000"), "2000")
+    s.set("A1", "0").unwrap()
+    assert_eq(s.display("A2000"), "1999")
+
+@test("recalculating the whole sheet gives the same answers")
+recalculate_all()
     var s = sheet("Sheet1")
 
     s.set("A1", "2").unwrap()
-    s.set("A2", "=A1*3").unwrap()
-    assert_eq(s.display("A2"), "6")
-    s.set("A1", "5").unwrap()
-    assert_eq(s.display("A2"), "15")
+    s.set("A2", "=A1^10").unwrap()
+    s.set("A3", "=A2&\"!\"").unwrap()
+    s.set("B1", "=B1").unwrap()
+    s.recalculate()
+    assert_eq(s.display("A2"), "1024")
+    assert_eq(s.display("A3"), "1024!")
+    assert(s.value("B1") == Error(Circular))
+
+@test("a reference to this sheet by name is a precedent; one to another sheet is #REF!")
+sheet_names_in_formulas()
+    var s = sheet("Data")
+
+    s.set("A1", "=data!B1*2").unwrap()
+    s.set("A2", "=Other!B1").unwrap()
+    s.set("B1", "4").unwrap()
+    assert_eq(s.display("A1"), "8")
+    assert_eq(s.display("A2"), "#REF!")
+
+@test("the README's example does what it says")
+readme_example()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "4").unwrap()
+    s.set("A2", "=A1^2/2").unwrap()
+    s.set("A3", "=IF(A2>5,\"big\",\"small\")&\" \"&SUM(A1:A2)").unwrap()
+    assert_eq(s.display("A3"), "big 12")
+    s.set("A1", "1").unwrap()
+    assert_eq(s.display("A3"), "small 1.5")
+    assert_eq(s.formula("A2").unwrap(), "=A1^2/2")

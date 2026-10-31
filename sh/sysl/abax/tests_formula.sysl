@@ -1,13 +1,197 @@
 module sh.sysl.abax
 @tests
 
-// A formula read and written back.
+// A formula read and written back, or the message it was refused with.
 private round_trip(text: string) -> string
     parse_formula(text) match
         Ok(e) -> formula_text(e)
         Err(m) -> "error: " + m
 
-@test("a formula reads and writes back")
-formula_round_trip()
+// The tree of a formula, fully parenthesised, so a test can see how it grouped.
+private shape(text: string) -> string
+    parse_formula(text) match
+        Ok(e) -> tree(e)
+        Err(m) -> "error: " + m
+
+private tree(e: &Expr) -> string
+    *e match
+        Negate(x) -> "(-" + tree(x) + ")"
+        Posit(x) -> "(+" + tree(x) + ")"
+        PercentOf(x) -> "(" + tree(x) + "%)"
+        Binary(op, a, b) -> "(" + tree(a) + op.text() + tree(b) + ")"
+        Group(x) -> tree(x)
+        _ -> formula_text(e)
+
+// --- Reading and writing back -----------------------------------------------------------------------
+
+@test("a formula is written back in canonical form: upper-case names, no spaces")
+canonical()
     assert_eq(round_trip("1+2*3"), "1+2*3")
-    assert_eq(round_trip("sum( a1 : b2 , $C$3 )"), "SUM(A1:B2,$C$3)")
+    assert_eq(round_trip(" sum( a1 : b2 , $C$3 ) "), "SUM(A1:B2,$C$3)")
+    assert_eq(round_trip("if(true,\"yes\",false)"), "IF(TRUE,\"yes\",FALSE)")
+    assert_eq(round_trip("(1+2)*3"), "(1+2)*3")
+    assert_eq(round_trip("-a1%"), "-A1%")
+    assert_eq(round_trip("1.50"), "1.5")
+    assert_eq(round_trip("1e3"), "1000")
+    assert_eq(round_trip("a1<>b1"), "A1<>B1")
+    assert_eq(round_trip("a1<=b1"), "A1<=B1")
+    assert_eq(round_trip("a1>=b1"), "A1>=B1")
+    assert_eq(round_trip("\"a\"&\"b\""), "\"a\"&\"b\"")
+
+@test("writing a formula back and reading it again gives the same text")
+round_trips()
+    for f in ["SUM(A1:B2,$C$3)", "-2^2", "2^3^2", "A1*(B1+C1)/2", "\"say \"\"hi\"\"\"", "IF(A1,,2)",
+            "Sheet2!A1+'My sheet'!$B$2:C3", "SUM(A:A,3:3,$B:$C,$4:$5)", "#N/A", "IFERROR(1/0,#DIV/0!)", "PI()",
+            "1e+300*2", "--A1", "'Bob''s'!A1", "foo+1", "A1:B2"]
+        val once = round_trip(f)
+
+        assert_eq(round_trip(once), once)
+
+@test("a string's doubled quote is one quote")
+strings()
+    parse_formula("\"say \"\"hi\"\"\"") match
+        Ok(e) ->
+            e match
+                Literal(v) -> assert(v == Text("say \"hi\""))
+                _ -> assert(false)
+        Err(_) -> assert(false)
+
+    assert_eq(round_trip("\"\""), "\"\"")
+    assert_eq(round_trip("\"héllo\""), "\"héllo\"")
+
+@test("error values are literals, in any case")
+error_literals()
+    assert_eq(round_trip("#n/a"), "#N/A")
+    assert_eq(round_trip("#div/0!+#VALUE!"), "#DIV/0!+#VALUE!")
+    assert_eq(round_trip("#NULL!"), "#NULL!")
+    assert_eq(round_trip("#NUM!"), "#NUM!")
+    assert_eq(round_trip("#REF!"), "#REF!")
+    assert_eq(round_trip("#NAME?"), "#NAME?")
+
+@test("references keep their dollar signs, whole columns and rows included")
+references()
+    assert_eq(round_trip("$a$1+a$1+$a1"), "$A$1+A$1+$A1")
+    assert_eq(round_trip("sum(a:c)"), "SUM(A:C)")
+    assert_eq(round_trip("sum($a:$a)"), "SUM($A:$A)")
+    assert_eq(round_trip("sum(3:5)"), "SUM(3:5)")
+    assert_eq(round_trip("sum($3:$3)"), "SUM($3:$3)")
+    assert_eq(round_trip("XFD1048576"), "XFD1048576")
+    assert_eq(round_trip("a1 : b2"), "A1:B2")
+
+@test("one past the sheet's last column or row is a name, not a reference")
+references_past_the_edge()
+    parse_formula("XFE1") match
+        Ok(e) ->
+            e match
+                Name(n) -> assert_eq(n, "XFE1")
+                _ -> assert(false)
+        Err(_) -> assert(false)
+
+    parse_formula("A1048577") match
+        Ok(e) ->
+            e match
+                Name(_) -> ()
+                _ -> assert(false)
+        Err(_) -> assert(false)
+
+@test("a sheet name qualifies a reference, quoted where it needs to be")
+sheet_references()
+    assert_eq(round_trip("Sheet2!A1"), "Sheet2!A1")
+    assert_eq(round_trip("'My sheet'!A1:B2"), "'My sheet'!A1:B2")
+    assert_eq(round_trip("'Plain'!A1"), "Plain!A1")
+    assert_eq(round_trip("'It''s'!$C$3"), "'It''s'!$C$3")
+    assert_eq(round_trip("Data!B:B"), "Data!B:B")
+
+@test("a word followed by a bracket is a call, even when it reads as a cell")
+calls()
+    assert_eq(round_trip("log10(100)"), "LOG10(100)")
+    assert_eq(round_trip("true()"), "TRUE()")
+    assert_eq(round_trip("sum()"), "SUM()")
+    assert_eq(round_trip("if(a1,,)"), "IF(A1,,)")
+    assert_eq(round_trip("f(g(h(1)))"), "F(G(H(1)))")
+
+@test("the precedents of a formula are the areas it reads on its own sheet")
+precedents_recorded()
+    val e = parse_formula("A1+SUM(B1:C2)+Other!D4+Sheet1!E5+F:F").unwrap()
+    val ps = precedents(e, "Sheet1")
+
+    assert_eq(ps.len(), 4)
+    assert(ps.at(0) == Area(0, 0, 0, 0))
+    assert(ps.at(1) == Area(1, 0, 2, 1))
+    assert(ps.at(2) == Area(4, 4, 4, 4))
+    assert(ps.at(3) == Area(5, 0, 5, MAX_ROWS - 1))
+
+// --- Precedence -------------------------------------------------------------------------------------
+
+@test("operators group with Excel's precedence")
+precedence()
+    assert_eq(shape("1+2*3"), "(1+(2*3))")
+    assert_eq(shape("1*2+3"), "((1*2)+3)")
+    assert_eq(shape("1-2-3"), "((1-2)-3)")
+    assert_eq(shape("8/4/2"), "((8/4)/2)")
+    assert_eq(shape("2*3^2"), "(2*(3^2))")
+    assert_eq(shape("1&2+3"), "(1&(2+3))")
+    assert_eq(shape("1+2&3"), "((1+2)&3)")
+    assert_eq(shape("1&2=3"), "((1&2)=3)")
+    assert_eq(shape("1=2&3"), "(1=(2&3))")
+    assert_eq(shape("1<2=TRUE"), "((1<2)=TRUE)")
+    assert_eq(shape("2^3%"), "(2^(3%))")
+    assert_eq(shape("2*3%"), "(2*(3%))")
+    assert_eq(shape("(1+2)*3"), "((1+2)*3)")
+
+@test("negation binds tighter than ^, and ^ groups to the left, as Excel has it")
+excel_quirks()
+    assert_eq(shape("-2^2"), "((-2)^2)")
+    assert_eq(shape("2^3^2"), "((2^3)^2)")
+    assert_eq(shape("2^-2"), "(2^(-2))")
+    assert_eq(shape("-2%"), "((-2)%)")
+    assert_eq(shape("--1"), "(-(-1))")
+    assert_eq(shape("1--1"), "(1-(-1))")
+    assert_eq(shape("-A1*2"), "((-A1)*2)")
+    assert_eq(shape("+1"), "(+1)")
+
+// --- Refusals ---------------------------------------------------------------------------------------
+
+@test("a formula that does not parse is refused with a reason, not a crash")
+parse_errors()
+    assert_eq(round_trip(""), "error: the formula is empty")
+    assert_eq(round_trip("   "), "error: the formula is empty")
+    assert_eq(round_trip("1+"), "error: the formula ends where an operand was expected")
+    assert_eq(round_trip("(1+2"), "error: a ')' is missing for the '(' at 1")
+    assert_eq(round_trip("1+2)"), "error: ')' was not expected, at 4")
+    assert_eq(round_trip("SUM(1,2"), "error: a ')' is missing for the call at 1")
+    assert_eq(round_trip("SUM(1 2)"), "error: a ')' is missing for the call at 1")
+    assert_eq(round_trip("\"abc"), "error: a string is not closed")
+    assert_eq(round_trip("1 2"), "error: '2' was not expected, at 3")
+    assert_eq(round_trip("*3"), "error: '*' was not expected, at 1")
+    assert_eq(round_trip("1+@"), "error: '@' is not part of a formula, at 3")
+    assert_eq(round_trip("#WHAT"), "error: '#WHAT' is not an error value")
+    assert_eq(round_trip("12abc"), "error: '12abc' is not a number")
+    assert_eq(round_trip("$"), "error: '$' must be followed by a reference, at 1")
+    assert_eq(round_trip("Sheet2!"), "error: 'Sheet2!' must be followed by a reference")
+    assert_eq(round_trip("'My sheet'A1"), "error: a quoted sheet name must be followed by '!'")
+    assert_eq(round_trip("'My sheet"), "error: a quoted sheet name is not closed")
+    assert_eq(round_trip("1:2+A1:3"), "error: ':' needs a cell reference on each side, at 7")
+    assert_eq(round_trip("(1"), "error: a ')' is missing for the '(' at 1")
+    assert_eq(round_trip("1é"), "error: 'é' is not part of a formula, at 2")
+
+@test("a formula nested too deeply is refused rather than overflowing the stack")
+too_deep()
+    var f = ""
+
+    for _ in 0..<500
+        f = f + "("
+
+    f = f + "1"
+
+    for _ in 0..<500
+        f = f + ")"
+
+    assert_eq(round_trip(f), "error: the formula nests too deeply")
+
+    var g = ""
+
+    for _ in 0..<150
+        g = g + "-"
+
+    assert_eq(round_trip(g + "1"), g + "1")

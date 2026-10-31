@@ -445,8 +445,8 @@ private concat(s: Sheet, args: Buf[&Expr]) -> Result[string, Fault]
             Range(a) ->
                 val c = s.clamp(a)
 
-                for r in c.row1..c.row2 + 1
-                    for k in c.col1..c.col2 + 1
+                for r in c.row1..c.row2
+                    for k in c.col1..c.col2
                         sb.push(to_text(s.value_at(k, r))?)
             Scalar(v) -> sb.push(to_text(v)?)
 
@@ -563,10 +563,10 @@ private line_of(s: Sheet, a: Area, down: bool) -> Buf[(int, int)]
     var out: Buf[(int, int)] = buf()
 
     if down
-        for r in c.row1..c.row2 + 1
+        for r in c.row1..c.row2
             out.push((c.col1, r))
     else
-        for k in c.col1..c.col2 + 1
+        for k in c.col1..c.col2
             out.push((k, c.row1))
 
     out
