@@ -116,10 +116,10 @@ precedents_recorded()
     val ps = precedents(e, "Sheet1")
 
     assert_eq(ps.len(), 4)
-    assert(ps.at(0) == Area(0, 0, 0, 0))
-    assert(ps.at(1) == Area(1, 0, 2, 1))
-    assert(ps.at(2) == Area(4, 4, 4, 4))
-    assert(ps.at(3) == Area(5, 0, 5, MAX_ROWS - 1))
+    assert(ps[0] == Area(0, 0, 0, 0))
+    assert(ps[1] == Area(1, 0, 2, 1))
+    assert(ps[2] == Area(4, 4, 4, 4))
+    assert(ps[3] ==Area(5, 0, 5, MAX_ROWS - 1))
 
 // --- Precedence -------------------------------------------------------------------------------------
 

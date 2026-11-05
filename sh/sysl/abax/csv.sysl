@@ -70,7 +70,7 @@ write_csv(s: Sheet, sep: u8 = u8(',')) -> string
 
     for r in 0..<rows + 1
         for c in 0..<cols + 1
-            if c > 0 then sb.bytes.push(sep)
+            if c > 0 then sb.push_char(char(sep))
 
             sb.push(csv_field(s.value_at(c, r), sep))
 

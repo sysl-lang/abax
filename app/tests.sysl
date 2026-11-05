@@ -26,8 +26,8 @@ private keys(m: &Model, c: *Recorder, ps: []Press)
 
     frame(m, c)
 
-private shift(k: Key) -> Press = Press(k, true, false)
-private ctrl(k: Key) -> Press = Press(k, false, true)
+private shift(k: Key) -> Press = Press(k, true, false, false, false)
+private ctrl(k: Key) -> Press = Press(k, false, true, false, false)
 
 // The middle of a cell on the recorder's grid, while it is scrolled to the top left.
 private cx(col: int) -> int = 70 + col * 80 + 40
@@ -142,7 +142,7 @@ leaping()
 
     // With shift, the far corner leaps and the active cell stays.
     m.go(0, 0)
-    m.key(Press(Key.Down, true, true))
+    m.key(Press(Key.Down, true, true, false, false))
     assert(placed(m, 0, 0, 0, 4))
 
 @test("following the active cell scrolls just far enough, both ways")
@@ -186,6 +186,20 @@ paging()
 
     m.page(true, true)
     assert(placed(m, 2, 0, 2, 10))
+
+@test("the Page Up and Page Down keys page, and Insert and function keys do nothing")
+paging_keys()
+    val m = model()
+
+    m.room_h = 220
+    m.go(2, 4)
+    m.key(Press(Key.PageDown, false, false, false, false))
+    assert_eq(m.address(), "C15")
+    m.key(Press(Key.PageUp, false, false, false, false))
+    assert_eq(m.address(), "C5")
+    m.key(Press(Key.Insert, false, false, false, false))
+    m.key(Press(Key.F(5), false, false, false, false))
+    assert_eq(m.address(), "C5")
 
 @test("the wheel scrolls by whole rows and keeps what is left over")
 wheeling()

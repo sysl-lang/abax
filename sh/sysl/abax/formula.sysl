@@ -617,7 +617,7 @@ formula_text(e: &Expr) -> string
             for i in 0..<args.len()
                 if i > 0 then sb.push(",")
 
-                sb.push(formula_text(args.at(i)))
+                sb.push(formula_text(args[i]))
 
             sb.push(")")
             sb.finish()
@@ -647,6 +647,6 @@ private collect(e: &Expr, sheet: string, out: *Buf[Area])
             collect(b, sheet, out)
         Call(_, args) ->
             for i in 0..<args.len()
-                collect(args.at(i), sheet, out)
+                collect(args[i], sheet, out)
         _ -> ()
 end collect

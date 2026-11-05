@@ -68,7 +68,7 @@ read_xlsx(bytes: []const u8) -> Result[Loaded, string]
 
     if sheets.len() == 0 then return Err(s"${book_part} names no sheet")
 
-    val first = sheets.at(0)
+    val first = sheets[0]
     val name = first.attr("name").unwrap_or("Sheet1")
     val id = relation_id(first) match
         Some(got) -> got
@@ -83,7 +83,7 @@ read_xlsx(bytes: []const u8) -> Result[Loaded, string]
         var others = ""
 
         for i in 1..<sheets.len()
-            others = others + (if i > 1 then ", " else "") + "'" + sheets.at(i).attr("name").unwrap_or("?") + "'"
+            others = others + (if i > 1 then ", " else "") + "'" + sheets[i].attr("name").unwrap_or("?") + "'"
 
         notes.push(s"only the first sheet, '${name}', was read, since abax has one sheet; left out: ${others}")
 
@@ -443,7 +443,7 @@ private without_prefixes(e: &Expr) -> &Expr
             var out: Buf[&Expr] = buf()
 
             for i in 0..<args.len()
-                out.push(without_prefixes(args.at(i)))
+                out.push(without_prefixes(args[i]))
 
             var bare = name
 
@@ -466,7 +466,7 @@ private with_prefixes(e: &Expr) -> &Expr
             var out: Buf[&Expr] = buf()
 
             for i in 0..<args.len()
-                out.push(with_prefixes(args.at(i)))
+                out.push(with_prefixes(args[i]))
 
             var newer = false
 
@@ -486,18 +486,24 @@ unescaped(t: string) -> string
     var sb = str_builder()
     var i: usize = 0
 
+    // The bytes of `t` from `run` up to `i` are plain text not yet pushed; an escape ends the run, and
+    // its first byte is ASCII, so every cut falls on a character boundary.
+    var run: usize = 0
+
     while i < b.len
         if i + 7 <= b.len && b[i] == u8('_') && b[i + 1] == u8('x') && b[i + 6] == u8('_')
             parse_long_base(t[i + 2..<i + 6], 16) match
                 Ok(n) ->
+                    sb.push(t[run..<i])
                     sb.push_char(char(u32(n)))
                     i += 7
+                    run = i
                     continue
                 Err(_) -> ()
 
-        sb.bytes.push(b[i])
         i += 1
 
+    sb.push(t[run..<b.len])
     sb.finish()
 end unescaped
 
@@ -514,16 +520,23 @@ escaped(t: string) -> string
     val b = t.bytes
     var sb = str_builder()
 
+    // The bytes of `t` from `run` up to `i` are plain text not yet pushed; the bytes that get escaped
+    // are ASCII, so every cut falls on a character boundary.
+    var run: usize = 0
+
     for i in 0..<b.len
         val c = b[i]
 
         if c < 0x20 && c != u8('\t') && c != u8('\n')
+            sb.push(t[run..<i])
             sb.push(f"_x${c}%04X_")
+            run = i + 1
         elif c == u8('_') && i + 7 <= b.len && b[i + 1] == u8('x') && b[i + 6] == u8('_') && is_hex4(t[i + 2..<i + 6])
+            sb.push(t[run..<i])
             sb.push("_x005F_")
-        else
-            sb.bytes.push(c)
+            run = i + 1
 
+    sb.push(t[run..<b.len])
     sb.finish()
 end escaped
 

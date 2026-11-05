@@ -238,14 +238,14 @@ struct Sheet
         self.readers.get(k) match
             Some(rs) ->
                 for i in 0..<rs.len()
-                    out.push(rs.at(i))
+                    out.push(rs[i])
             None -> ()
 
         val col = col_of(k)
         val row = row_of(k)
 
         for i in 0..<self.watches.len()
-            val w = self.watches.at(i)
+            val w = self.watches[i]
 
             if w.area.contains(col, row) then out.push(w.reader)
 
@@ -254,7 +254,7 @@ struct Sheet
 
     private link(*self, k: long, reads: Buf[Area])
         for i in 0..<reads.len()
-            val a = reads.at(i)
+            val a = reads[i]
 
             if a.is_cell()
                 val at = key(a.col1, a.row1)
@@ -273,7 +273,7 @@ struct Sheet
             None -> return
 
         for i in 0..<old.len()
-            val a = old.at(i)
+            val a = old[i]
 
             if a.is_cell()
                 val at = key(a.col1, a.row1)
@@ -283,7 +283,7 @@ struct Sheet
                         var kept: Buf[long] = buf()
 
                         for j in 0..<rs.len()
-                            if rs.at(j) != k then kept.push(rs.at(j))
+                            if rs[j] != k then kept.push(rs[j])
 
                         if kept.len() == 0 then val _ = self.readers.remove(at) else self.readers.put(at, kept)
                     None -> ()
@@ -291,7 +291,7 @@ struct Sheet
         var kept: Buf[Watch] = buf()
 
         for i in 0..<self.watches.len()
-            if self.watches.at(i).reader != k then kept.push(self.watches.at(i))
+            if self.watches[i].reader != k then kept.push(self.watches[i])
 
         self.watches = kept
     end unlink
@@ -315,9 +315,9 @@ struct Sheet
             val ds = self.dependents(at)
 
             for i in 0..<ds.len()
-                if !seen.has(ds.at(i))
-                    seen.put(ds.at(i), true)
-                    todo.push(ds.at(i))
+                if !seen.has(ds[i])
+                    seen.put(ds[i], true)
+                    todo.push(ds[i])
 
         self.recalculate_cells(all)
     end recalculate_from
@@ -330,26 +330,26 @@ struct Sheet
         var index: Map[long, usize] = map()
 
         for i in 0..<cells.len()
-            index.put(cells.at(i), i)
+            index.put(cells[i], i)
 
         var g = graph(cells.len())
 
         for i in 0..<cells.len()
-            val ds = self.dependents(cells.at(i))
+            val ds = self.dependents(cells[i])
 
             for j in 0..<ds.len()
-                index.get(ds.at(j)) match
+                index.get(ds[j]) match
                     Some(d) -> g.edge(d, i)
                     None -> ()
 
         val order = g.components()
 
         for c in 0..<order.len()
-            val comp = order.at(c)
-            val cyclic = comp.len() > 1 || g.reads_itself(comp.at(0))
+            val comp = order[c]
+            val cyclic = comp.len() > 1 || g.reads_itself(comp[0])
 
             for m in 0..<comp.len()
-                val at = cells.at(comp.at(m))
+                val at = cells[comp[m]]
 
                 self.cells.get(at) match
                     Some(slot) ->
@@ -410,16 +410,16 @@ private struct Graph
     out: Buf[Buf[usize]]
 
     edge(*self, from: usize, to: usize)
-        var es = self.edges.at(from)
+        var es = self.edges[from]
 
         es.push(to)
-        self.edges.set(from, es)
+        self.edges[from] = es
 
     reads_itself(self, n: usize) -> bool
-        val es = self.edges.at(n)
+        val es = self.edges[n]
 
         for i in 0..<es.len()
-            if es.at(i) == n then return true
+            if es[i] == n then return true
 
         false
     end reads_itself
@@ -427,36 +427,36 @@ private struct Graph
     // The components, each after every component it has an edge into.
     components(*self) -> Buf[Buf[usize]]
         for n in 0..<self.edges.len()
-            if self.order.at(n) == 0 then self.visit(n)
+            if self.order[n] == 0 then self.visit(n)
 
         self.out
     end components
 
     private visit(*self, n: usize)
         self.next += 1
-        self.order.set(n, self.next)
-        self.low.set(n, self.next)
+        self.order[n] = self.next
+        self.low[n] = self.next
         self.stack.push(n)
-        self.on_stack.set(n, true)
+        self.on_stack[n] = true
 
-        val es = self.edges.at(n)
+        val es = self.edges[n]
 
         for i in 0..<es.len()
-            val m = es.at(i)
+            val m = es[i]
 
-            if self.order.at(m) == 0
+            if self.order[m] == 0
                 self.visit(m)
-                self.low.set(n, self.low.at(n).min(self.low.at(m)))
-            elif self.on_stack.at(m)
-                self.low.set(n, self.low.at(n).min(self.order.at(m)))
+                self.low[n] = self.low[n].min(self.low[m])
+            elif self.on_stack[m]
+                self.low[n] = self.low[n].min(self.order[m])
 
-        if self.low.at(n) == self.order.at(n)
+        if self.low[n] == self.order[n]
             var comp: Buf[usize] = buf()
 
             loop
                 val m = self.stack.pop().unwrap()
 
-                self.on_stack.set(m, false)
+                self.on_stack[m] = false
                 comp.push(m)
 
                 if m == n then break

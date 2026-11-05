@@ -8,7 +8,7 @@
 // as bytes. The application, a window with a menu, a formula bar and the grid, is the workspace member
 // in `app/`, so a program taking the library does not take SDL with it; `cli/` is `abax-cli`, which
 // prints and converts files.
-package { name = "abax", version = "0.1.0", sysl = "0.8.10" }
+package { name = "abax", version = "0.1.0", sysl = "0.9.0" }
 
 optimization = "2"
 
@@ -21,7 +21,7 @@ requires {
 
 // The formula parser runs on the Pratt loop and the token cursor; an `.xlsx` is a zip of XML parts.
 dependencies {
-  parsing { git = "github.com/sysl-lang/parsing", version = "0.13.3" }
+  parsing { git = "github.com/sysl-lang/parsing", version = "0.14.1" }
   zip     { git = "github.com/sysl-lang/zip", version = "0.1.0" }
-  xml     { git = "github.com/sysl-lang/xml", version = "0.1.0" }
+  xml     { git = "github.com/sysl-lang/xml", version = "0.1.1" }
 }

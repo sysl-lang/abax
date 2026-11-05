@@ -51,7 +51,7 @@ adjust(e: &Expr, sheet: string, how: Adjust) -> &Expr
             var out: Buf[&Expr] = buf()
 
             for i in 0..<args.len()
-                out.push(adjust(args.at(i), sheet, how))
+                out.push(adjust(args[i], sheet, how))
 
             Call(name, out)
         _ -> e

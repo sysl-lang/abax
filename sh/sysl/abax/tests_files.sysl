@@ -276,6 +276,27 @@ xlsx_escapes()
     for t in ["plain", "a\rb", "_x0041_", "\u{1F}\u{1}", "_x005F_"]
         assert_eq(unescaped(escaped(t)), t)
 
+@test("_xHHHH_ escapes leave é, € and 😀 whole")
+xlsx_escapes_unicode()
+    assert_eq(unescaped("é_x000D_€_x005F_x0041_😀"), "é\r€_x0041_😀")
+    assert_eq(unescaped("😀é_xZZZZ_€"), "😀é_xZZZZ_€")
+    assert_eq(escaped("é\u{1}€_x0041_😀"), "é_x0001_€_x005F_x0041_😀")
+    assert_eq(escaped("😀\u{1F}é"), "😀_x001F_é")
+
+    for t in ["é€😀", "é\u{1}€_x0041_😀", "😀_x005F_é\r"]
+        assert_eq(unescaped(escaped(t)), t)
+
+@test("CSV written with a separator keeps non-ASCII fields whole")
+csv_write_unicode()
+    var s = sheet("Sheet1")
+
+    s.set("A1", "é€").unwrap()
+    s.set("B1", "😀").unwrap()
+    s.set("A2", "'é,😀").unwrap()
+
+    assert_eq(write_csv(s), "é€,😀\r\n\"é,😀\",\r\n")
+    assert_eq(write_csv(s, u8(';')), "é€;😀\r\né,😀;\r\n")
+
 // A package of the given parts, for the malformed ones.
 private package(parts: []const (string, string)) -> Buf[u8]
     var z = zip_writer()

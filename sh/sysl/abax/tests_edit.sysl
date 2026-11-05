@@ -586,3 +586,21 @@ tsv_read()
     assert_eq(l[0][2], "")
     assert_eq(l[1][0], "")
     assert_eq(l[1][1], "x")
+
+@test("fields read with non-ASCII text between quotes, separators and line breaks")
+tsv_read_unicode()
+    val l = read_tsv("é\t\"€\"\"x\nz\"\t😀a\r\né😀\t€\n")
+
+    assert_eq(l.len(), 2)
+    assert_eq(l[0].len(), 3)
+    assert_eq(l[0][0], "é")
+    assert_eq(l[0][1], "€\"x\nz")
+    assert_eq(l[0][2], "😀a")
+    assert_eq(l[1].len(), 2)
+    assert_eq(l[1][0], "é😀")
+    assert_eq(l[1][1], "€")
+
+    val tail = read_tsv("😀\t€é")
+
+    assert_eq(tail[0][0], "😀")
+    assert_eq(tail[0][1], "€é")

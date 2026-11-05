@@ -3,7 +3,7 @@
 //     sysl run cli -- budget.xlsx --cell B4
 //     sysl run cli -- convert budget.xlsx budget.csv
 //     sysl run cli -- dump budget.xlsx
-package { name = "abax-cli", version = "0.1.0", sysl = "0.8.10" }
+package { name = "abax-cli", version = "0.1.0", sysl = "0.9.0" }
 
 optimization = "2"
 

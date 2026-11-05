@@ -366,6 +366,10 @@ struct Model
                 if p.ctrl then self.go(self.sheet.last_col.max(0), self.sheet.last_row.max(0))
             Key.Delete -> self.clear()
             Key.Backspace -> self.clear()
+            Key.PageUp -> self.page(false, p.shift)
+            Key.PageDown -> self.page(true, p.shift)
+            Key.Insert -> ()
+            Key.F(_) -> ()
             Key.Escape ->
                 self.message = ""
                 self.clip = None

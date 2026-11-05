@@ -428,8 +428,16 @@ read_fields(text: string, sep: u8) -> Buf[Buf[string]]
     var quoting = false
     var started = false
 
+    // The bytes of `text` from `run` up to the one being read are field text not yet pushed; they are
+    // pushed as one slice when a quote, a separator or a line break ends the run, all of which are ASCII,
+    // so every cut falls on a character boundary.
+    var run: usize = 0
+
     while i < b.len
         val c = b[i]
+        val special = if quoting then c == u8('"') else (c == u8('"') && !started) || c == sep || c == u8('\n') || c == u8('\r')
+
+        if special then sb.push(text[run..<i])
 
         if quoting
             if c == u8('"')
@@ -438,8 +446,6 @@ read_fields(text: string, sep: u8) -> Buf[Buf[string]]
                     i += 1
                 else
                     quoting = false
-            else
-                sb.bytes.push(c)
         elif c == u8('"') && !started
             quoting = true
             started = true
@@ -456,10 +462,13 @@ read_fields(text: string, sep: u8) -> Buf[Buf[string]]
             sb = str_builder()
             started = false
         else
-            sb.bytes.push(c)
             started = true
 
         i += 1
+
+        if special then run = i
+
+    sb.push(text[run..<b.len])
 
     val last = sb.finish()
 
